@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test/lint/type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+htmlcov/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.*
+
+# Audio/runtime artifacts
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+audio_cache/
+recordings/
+latency_logs/
+logs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+nul
+.vscode/
+.idea/
+
+# Hermes/local runtime state
+.hermes/
+*.session
