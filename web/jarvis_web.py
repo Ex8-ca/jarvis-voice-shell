@@ -153,56 +153,80 @@ async def index():
     </div>
     
     <script>
-        let mediaRecorder = null;
-        let audioChunks = [];
+        let recognition = null;
         let isListening = false;
-        let audioContext = null;
+        
+        // Check if Speech Recognition is available
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            recognition = new SpeechRecognition();
+            recognition.continuous = false;
+            recognition.interimResults = true;
+            recognition.lang = 'en-US';
+            
+            recognition.onstart = () => {
+                isListening = true;
+                document.getElementById('mic-btn').classList.add('listening');
+                document.getElementById('mic-btn').innerHTML = '🔴';
+                document.getElementById('status').className = 'status listening';
+                document.getElementById('status').textContent = 'Listening...';
+            };
+            
+            recognition.onresult = (event) => {
+                let transcript = '';
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    transcript += event.results[i][0].transcript;
+                }
+                document.getElementById('status').textContent = `Heard: "${transcript}"`;
+                
+                if (event.results[event.results.length - 1].isFinal) {
+                    processText(transcript);
+                }
+            };
+            
+            recognition.onerror = (event) => {
+                console.error('Speech recognition error:', event.error);
+                document.getElementById('status').textContent = `Error: ${event.error}`;
+                resetUI();
+            };
+            
+            recognition.onend = () => {
+                if (isListening) {
+                    resetUI();
+                }
+            };
+        } else {
+            document.getElementById('status').textContent = 'Speech Recognition not supported';
+        }
+        
+        function resetUI() {
+            isListening = false;
+            document.getElementById('mic-btn').classList.remove('listening');
+            document.getElementById('mic-btn').innerHTML = '🎤';
+            document.getElementById('status').className = 'status';
+            document.getElementById('status').textContent = 'Ready';
+        }
+        
+        function toggleVoice() {
+            if (!recognition) {
+                document.getElementById('status').textContent = 'Speech Recognition not available';
+                return;
+            }
+            
+            if (isListening) {
+                recognition.stop();
+            } else {
+                recognition.start();
+            }
+        }
         
         // Load conversation history from localStorage
         let conversation = JSON.parse(localStorage.getItem('jarvis_convo') || '[]');
         renderConversation();
         
-        async function toggleVoice() {
-            const btn = document.getElementById('mic-btn');
-            const status = document.getElementById('status');
-            
-            if (isListening) {
-                // Stop listening
-                mediaRecorder.stop();
-                isListening = false;
-                btn.classList.remove('listening');
-                btn.innerHTML = '🎤';
-                status.className = 'status';
-                status.textContent = 'Processing...';
-            } else {
-                // Start listening
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    audioContext = new AudioContext();
-                    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-                    audioChunks = [];
-                    
-                    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-                    mediaRecorder.onstop = async () => {
-                        stream.getTracks().forEach(t => t.stop());
-                        await processAudio();
-                    };
-                    
-                    mediaRecorder.start();
-                    isListening = true;
-                    btn.classList.add('listening');
-                    btn.innerHTML = '🔴';
-                    status.className = 'status listening';
-                    status.textContent = 'Listening...';
-                } catch (err) {
-                    status.textContent = 'Mic error: ' + err.message;
-                    console.error(err);
-                }
-            }
-        }
-        
         async function processText(text) {
             const status = document.getElementById('status');
+            resetUI();
             status.className = 'status thinking';
             status.textContent = 'Thinking...';
             
@@ -213,7 +237,6 @@ async def index():
             try {
                 const response = await fetch(`/chat?text=${encodeURIComponent(text)}`);
                 const data = await response.json();
-                const elapsed = ((performance.now() - start) / 1000).toFixed(2);
                 
                 addMessage(data.response, 'jarvis', {
                     bridge_ms: data.bridge_ms,
@@ -230,56 +253,13 @@ async def index():
                     audio.play();
                     
                     audio.onended = () => {
-                        status.className = 'status';
-                        status.textContent = 'Ready';
+                        resetUI();
                     };
                 }
             } catch (err) {
                 status.textContent = 'Error: ' + err.message;
                 console.error(err);
-            }
-        }
-        
-        async function processAudio() {
-            const status = document.getElementById('status');
-            status.className = 'status thinking';
-            status.textContent = 'Processing...';
-            
-            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-            const formData = new FormData();
-            formData.append('audio', audioBlob, 'recording.webm');
-            
-            const start = performance.now();
-            
-            try {
-                const response = await fetch('/process', {
-                    method: 'POST',
-                    body: formData
-                });
-                const data = await response.json();
-                const elapsed = ((performance.now() - start) / 1000).toFixed(2);
-                
-                addMessage(data.transcript || '(no speech)', 'user');
-                addMessage(data.response, 'jarvis', {
-                    bridge_ms: data.bridge_ms,
-                    tts_ms: data.tts_ms,
-                    total_ms: data.total_ms
-                });
-                
-                // Play TTS audio
-                if (data.audio_url) {
-                    status.className = 'status speaking';
-                    status.textContent = 'Speaking...';
-                    
-                    const audio = new Audio(data.audio_url);
-                    await audio.play();
-                    
-                    status.className = 'status';
-                    status.textContent = 'Ready';
-                }
-            } catch (err) {
-                status.textContent = 'Error: ' + err.message;
-                console.error(err);
+                resetUI();
             }
         }
         
