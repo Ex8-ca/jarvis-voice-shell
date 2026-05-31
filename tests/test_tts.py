@@ -414,3 +414,161 @@ async def test_cancel_playback_requests_sounddevice_stop(monkeypatch):
 
     assert tts._cancel_requested is True
     assert FakeSoundDevice.stopped is True
+
+
+# ---------------------------------------------------------------------------
+# Streaming TTS tests
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingConfig:
+    """Configuration for streaming TTS."""
+
+    def test_streaming_enabled_default(self):
+        cfg = Config()
+        assert cfg.tts_streaming_enabled is True
+
+    def test_streaming_can_be_disabled(self):
+        cfg = Config(tts_streaming_enabled=False)
+        assert cfg.tts_streaming_enabled is False
+
+
+class TestMp3ChunkToPcm:
+    """MP3 chunk to PCM conversion via miniaudio."""
+
+    def test_mp3_chunk_to_pcm_static_method_exists(self):
+        assert hasattr(TTSEngine, "_mp3_chunk_to_pcm")
+        # Verify it's callable (static method)
+        # We can't test with real MP3 without network, but verify the method exists
+
+    def test_mp3_chunk_to_pcm_rejects_invalid_data(self):
+        """Invalid MP3 data should raise an exception."""
+        with pytest.raises(Exception):  # miniaudio.DecodeError or similar
+            TTSEngine._mp3_chunk_to_pcm(b"not valid mp3 data at all")
+
+
+class TestStreamingState:
+    """Streaming-specific state management."""
+
+    def test_streaming_state_initialized(self):
+        tts = TTSEngine(Config())
+        assert tts._pcm_queue is None
+        assert tts._pcm_total == 0
+        assert tts._stream_active is False
+        assert tts._sd_stream is None
+
+    def test_cancel_playback_resets_streaming_state(self):
+        """cancel_playback() should stop any active sounddevice stream."""
+        import threading
+
+        class FakeStream:
+            stopped = False
+            closed = False
+
+            def stop(self):
+                FakeStream.stopped = True
+
+            def close(self):
+                FakeStream.closed = True
+
+        class FakeSoundDevice:
+            @staticmethod
+            def stop():
+                pass
+
+        import sys
+
+        monkeypatch = type("FakeMonkeypatch", (), {"setitem": lambda s, m, v: None})()
+        sys.modules["sounddevice"] = FakeSoundDevice
+
+        tts = TTSEngine(Config())
+        tts._sd_stream = FakeStream()
+        tts._stream_event = threading.Event()
+
+        # Run cancel in an event loop
+        import asyncio
+
+        asyncio.get_event_loop().run_until_complete(tts.cancel_playback())
+
+        assert FakeStream.stopped is True
+        assert FakeStream.closed is True
+        assert tts._sd_stream is None
+
+
+class TestSpeakWithStreamingDisabled:
+    """Verify speak() falls back to buffered mode when streaming is disabled."""
+
+    @pytest.mark.asyncio
+    async def test_speak_uses_buffered_mode_when_streaming_disabled(self, monkeypatch, tmp_path):
+        cfg = Config(
+            cache_dir=tmp_path,
+            tts_streaming_enabled=False,
+            tts_playback_enabled=False,
+        )
+        tts = TTSEngine(cfg)
+
+        synthesis_called = False
+
+        async def mock_synth(text):
+            nonlocal synthesis_called
+            synthesis_called = True
+            return b"fake wav"
+
+        tts._synthesize_edge = mock_synth
+
+        await tts.speak("test text with streaming disabled")
+
+        assert synthesis_called, "Should use _synthesize_edge (buffered mode)"
+
+
+class TestSpeakWithStreamingEnabled:
+    """Verify speak() uses streaming mode when enabled."""
+
+    @pytest.mark.asyncio
+    async def test_speak_uses_streaming_when_enabled_and_cache_miss(self, monkeypatch, tmp_path):
+        cfg = Config(
+            cache_dir=tmp_path,
+            tts_streaming_enabled=True,
+            tts_playback_enabled=False,
+        )
+        tts = TTSEngine(cfg)
+
+        streaming_called = False
+
+        async def mock_streaming(text, latency=None):
+            nonlocal streaming_called
+            streaming_called = True
+
+        tts._speak_streaming_edge = mock_streaming
+
+        await tts.speak("test text with streaming enabled")
+
+        assert streaming_called, "Should use _speak_streaming_edge"
+
+    @pytest.mark.asyncio
+    async def test_speak_uses_buffered_on_cache_hit(self, monkeypatch, tmp_path):
+        """When cache hit, streaming mode should still use buffered playback (faster)."""
+        cfg = Config(
+            cache_dir=tmp_path,
+            tts_streaming_enabled=True,
+            tts_playback_enabled=False,
+        )
+        tts = TTSEngine(cfg)
+
+        # Pre-populate cache
+        output_path = tts._tts_output_path("cached text")
+        output_path.write_bytes(b"fake mp3 data for cache")
+
+        buffered_synth_called = False
+
+        async def mock_synth(text):
+            nonlocal buffered_synth_called
+            buffered_synth_called = True
+            return b"fake wav"
+
+        tts._synthesize_edge = mock_synth
+
+        await tts.speak("cached text")
+
+        # On cache hit, should use buffered synthesis path
+        assert buffered_synth_called, "Should use buffered synthesis on cache hit"

@@ -103,6 +103,9 @@ class Config:
     tts_playback_enabled: bool = True
     """Whether to play audio after synthesis. Set False to synthesize-only (dry run)."""
 
+    tts_streaming_enabled: bool = True
+    """Whether to stream audio chunks as they're generated (reduces time-to-first-audio)."""
+
     # -- STT (stub — will be activated with `stt` extra) ------------------------
     stt_engine: str = "stub"
     """STT backend: 'stub' (always returns placeholder), 'whisper' (future)."""
