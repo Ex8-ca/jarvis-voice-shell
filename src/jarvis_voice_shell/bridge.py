@@ -486,6 +486,7 @@ class HermesBridge:
             {"role": "user", "content": transcript},
         ]
         return {
+            "model": self._config.bridge_model,
             "messages": messages,
             "stream": self._config.bridge_stream if stream is None else stream,
             "temperature": 0.7,

@@ -87,6 +87,9 @@ class Config:
     bridge_max_tokens: int = field(default_factory=lambda: int(os.getenv("BRIDGE_MAX_TOKENS", "512")))
     """Maximum assistant tokens requested through the HTTP bridge."""
 
+    bridge_model: str = field(default_factory=lambda: os.getenv("BRIDGE_MODEL", "deepseek-chat"))
+    """Model name sent in API request. Set via BRIDGE_MODEL env var."""
+
     # -- TTS --------------------------------------------------------------------
     tts_engine: str = "edge"
     """TTS backend: 'edge' (v1), 'system' (future), 'piper' (future)."""
@@ -138,6 +141,7 @@ class Config:
             "HERMES_BRIDGE_URL": ("hermes_bridge_url", str),
             "API_SERVER_KEY": ("hermes_api_key", str),
             "BRIDGE_MAX_TOKENS": ("bridge_max_tokens", int),
+            "BRIDGE_MODEL": ("bridge_model", str),
             "JARVIS_TTS_ENGINE": ("tts_engine", str),
             "JARVIS_TTS_VOICE": ("tts_voice", str),
             "JARVIS_TTS_RATE": ("tts_rate", str),
