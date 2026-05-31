@@ -57,6 +57,39 @@ BRIDGE_MAX_TOKENS=512
 
 `API_SERVER_KEY` is required for Hermes Gateway HTTP mode. Use any private local value, but do not commit it.
 
+## Linux Setup
+
+On Linux (Ubuntu/Pop!_OS tested), use the provided setup and launcher scripts:
+
+```bash
+# Install system dependencies, create venv, install Python packages
+bash setup-linux.sh
+
+# Configure
+cp .env.example .env
+# Edit .env with your Hermes API key and bridge URL
+
+# Launch (always-on VAD mode)
+bash start-jarvis-linux.sh
+```
+
+If the wrong microphone is selected, list devices and pass an explicit index:
+```bash
+python -m jarvis_voice_shell.cli list-devices
+bash start-jarvis-linux.sh <device_index>
+```
+
+## Remote Hermes Gateway
+
+JARVIS can talk to a Hermes Agent running on a different machine. Set `HERMES_BRIDGE_URL` in `.env` to point at the remote endpoint:
+
+```bash
+HERMES_BRIDGE_URL=http://192.168.1.3:6789/v1/chat/completions
+API_SERVER_KEY=your-gateway-key
+```
+
+All audio processing (VAD, Whisper STT, Edge TTS, playback) remains local — only the LLM call goes over the network.
+
 ## Start Hermes Gateway
 
 In one terminal:

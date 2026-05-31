@@ -14,6 +14,15 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Load .env file if present (must be before any os.getenv calls)
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent.parent / '.env'
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass
+
 
 def _default_cache_dir() -> Path:
     """Platform-appropriate cache directory for audio artifacts."""
