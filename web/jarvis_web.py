@@ -138,6 +138,15 @@ async def index():
         
         <button class="btn" id="mic-btn" onclick="toggleVoice()">🎤</button>
         
+        <div style="margin: 15px 0;">
+            <input type="text" id="text-input" placeholder="Type your message..." 
+                   style="width: 70%; padding: 12px; border-radius: 8px; border: 1px solid #333; background: #1a1a2e; color: #e0e0e0; font-size: 1rem;">
+            <button onclick="sendText()" 
+                    style="padding: 12px 20px; border-radius: 8px; border: 1px solid #333; background: #00d4ff; color: #000; font-weight: bold; cursor: pointer;">Send</button>
+        </div>
+        
+        <p style="font-size: 0.8rem; color: #666;">💡 Mic requires HTTPS. Use text input for now.</p>
+        
         <div class="conversation" id="conversation"></div>
         
         <button onclick="clearChat()" style="margin-top: 20px; padding: 8px 16px; background: #333; color: #888; border: 1px solid #444; border-radius: 8px; cursor: pointer;">Clear Chat</button>
@@ -192,10 +201,49 @@ async def index():
             }
         }
         
-        async function processAudio() {
+        async function processText(text) {
             const status = document.getElementById('status');
             status.className = 'status thinking';
             status.textContent = 'Thinking...';
+            
+            addMessage(text, 'user');
+            
+            const start = performance.now();
+            
+            try {
+                const response = await fetch(`/chat?text=${encodeURIComponent(text)}`);
+                const data = await response.json();
+                const elapsed = ((performance.now() - start) / 1000).toFixed(2);
+                
+                addMessage(data.response, 'jarvis', {
+                    bridge_ms: data.bridge_ms,
+                    tts_ms: data.tts_ms,
+                    total_ms: data.total_ms
+                });
+                
+                // Play TTS audio
+                if (data.audio_url) {
+                    status.className = 'status speaking';
+                    status.textContent = 'Speaking...';
+                    
+                    const audio = new Audio(data.audio_url);
+                    audio.play();
+                    
+                    audio.onended = () => {
+                        status.className = 'status';
+                        status.textContent = 'Ready';
+                    };
+                }
+            } catch (err) {
+                status.textContent = 'Error: ' + err.message;
+                console.error(err);
+            }
+        }
+        
+        async function processAudio() {
+            const status = document.getElementById('status');
+            status.className = 'status thinking';
+            status.textContent = 'Processing...';
             
             const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
             const formData = new FormData();
@@ -258,6 +306,20 @@ async def index():
             localStorage.removeItem('jarvis_convo');
             document.getElementById('conversation').innerHTML = '';
         }
+        
+        async function sendText() {
+            const input = document.getElementById('text-input');
+            const text = input.value.trim();
+            if (!text) return;
+            
+            input.value = '';
+            await processText(text);
+        }
+        
+        // Allow Enter key to send
+        document.getElementById('text-input')?.addEventListener('keypress', e => {
+            if (e.key === 'Enter') sendText();
+        });
     </script>
 </body>
 </html>
