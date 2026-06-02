@@ -37,7 +37,7 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 logger = logging.getLogger("hermes-voice-client")
 
@@ -387,9 +387,11 @@ async def run() -> None:
                             elif mtype == "speaking":
                                 logger.info("TTS playing...")
                             elif mtype == "error":
-                                logger.error(
-                                    "Server error: %s", data.get("message")
-                                )
+                                # Tolerate both "message" (canonical) and "text"
+                                # (legacy) keys — gateway has used both at
+                                # different points in its history.
+                                err = data.get("message") or data.get("text") or "(no message)"
+                                logger.error("Server error: %s", err)
                                 # Drop any partial MP3 — TTS aborted.
                                 if mp3_buffer:
                                     logger.warning(

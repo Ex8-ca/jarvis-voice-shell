@@ -304,8 +304,14 @@ async def voice_websocket(ws: WebSocket):
     FRAME_MS = 63
     SAMPLES_PER_FRAME = 16000 * FRAME_MS // 1000  # 1008
 
+    # VAD threshold. Default 1500 to ignore ambient room noise / TV / music.
+    # Tune via HERMES_VAD_ENERGY_THRESHOLD in .env. Browser wake-word uses
+    # 1500 too — matching that gives consistent behavior across web + client.
+    import os as _os
+    _vad_threshold = int(_os.environ.get("HERMES_VAD_ENERGY_THRESHOLD", "1500"))
+
     vad = EnergyVAD(
-        energy_threshold=300,
+        energy_threshold=_vad_threshold,
         start_frames=3,
         end_silence_frames=5,   # 5 × 63ms = 315ms silence (was 11 = 693ms)
         pre_roll_frames=5,
