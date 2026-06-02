@@ -37,7 +37,7 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 logger = logging.getLogger("hermes-voice-client")
 
@@ -53,6 +53,14 @@ AUDIO_CHANNELS = 1
 AUDIO_SAMPLE_WIDTH = 2
 SAMPLES_PER_FRAME = AUDIO_SAMPLE_RATE * 63 // 1000  # 1008 samples = 63ms
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * AUDIO_SAMPLE_WIDTH  # 2016
+
+# Many output devices (e.g. laptop analog jacks, some HDMI sinks) don't
+# natively support 16kHz, which is what the gateway uses. PortAudio's ALSA
+# backend will then fail with "paInvalidSampleRate" and the output stream
+# silently never starts. Using a universally-supported rate for the speaker
+# lets PortAudio transparently resample from 16kHz MP3 → 48kHz PCM.
+SPEAKER_SAMPLE_RATE = 48000
+SPEAKER_BLOCK_SIZE = 2048
 
 
 # ── Device enumeration ───────────────────────────────────────────────
@@ -170,14 +178,18 @@ class MicCapture:
 # ── MP3 decode + speaker ─────────────────────────────────────────────
 
 def decode_mp3(mp3_data: bytes) -> bytes:
-    """Decode MP3 bytes → 16-bit mono PCM at 16kHz via miniaudio."""
+    """Decode MP3 bytes → 16-bit mono PCM at SPEAKER_SAMPLE_RATE via miniaudio.
+
+    The output is resampled to the speaker's native rate, since most output
+    devices (laptop analog jacks, HDMI sinks, Bluetooth) don't accept 16kHz.
+    """
     import miniaudio as ma
     try:
         decoded = ma.decode(
             mp3_data,
             output_format=ma.SampleFormat.SIGNED16,
             nchannels=1,
-            sample_rate=AUDIO_SAMPLE_RATE,
+            sample_rate=SPEAKER_SAMPLE_RATE,
         )
         samples = decoded.samples
         if samples is None or len(samples) == 0:
@@ -204,7 +216,7 @@ class Speaker:
         logger.info(
             "Speaker: device=%s rate=%d",
             self.device if self.device is not None else "default",
-            AUDIO_SAMPLE_RATE,
+            SPEAKER_SAMPLE_RATE,
         )
 
     async def _play_loop(self) -> None:
@@ -223,8 +235,8 @@ class Speaker:
         self._stream = sd.OutputStream(
             device=self.device,
             channels=AUDIO_CHANNELS,
-            samplerate=AUDIO_SAMPLE_RATE,
-            blocksize=2048,
+            samplerate=SPEAKER_SAMPLE_RATE,
+            blocksize=SPEAKER_BLOCK_SIZE,
             dtype="int16",
             callback=callback,
         )
@@ -236,7 +248,8 @@ class Speaker:
         pcm = decode_mp3(mp3_data)
         if not pcm:
             return
-        chunk_size = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH // 20  # 50ms
+        # Send in chunks of ~50ms worth of samples (at the speaker's rate).
+        chunk_size = SPEAKER_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH // 20
         for i in range(0, len(pcm), chunk_size):
             await self._queue.put(pcm[i:i + chunk_size])
 

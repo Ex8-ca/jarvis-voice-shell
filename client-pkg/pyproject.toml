@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-voice-client"
-version = "0.1.1"
+version = "0.1.2"
 description = "Standalone Python voice client for the hermes-voice gateway — captures mic, plays TTS, talks over WebSocket"
 readme = "README.md"
 requires-python = ">=3.11"
