@@ -388,18 +388,84 @@ class Speaker:
 
 # ── WebSocket client ─────────────────────────────────────────────────
 
+def resolve_device(
+    requested: Optional[int],
+    kind: str,
+    inputs: dict,
+    outputs: dict,
+) -> Optional[int]:
+    """Resolve an audio device index. Returns None to use system default.
+
+    Args:
+        requested: device index from env var, or None for auto-detect
+        kind: "input" or "output"
+        inputs/outputs: dicts from get_devices()
+    """
+    devs = inputs if kind == "input" else outputs
+
+    # 1. Explicit env var — must be a valid index
+    if requested is not None:
+        if requested in devs:
+            return requested
+        logger.error(
+            "Requested %s device %d not found. Available: %s",
+            kind, requested, sorted(devs.keys()),
+        )
+        raise SystemExit(1)
+
+    # 2. Try system default
+    try:
+        default_idx = sd.default.device[0 if kind == "input" else 1]
+        if default_idx >= 0 and default_idx in devs:
+            logger.info("Using system default %s device: %d (%s)",
+                       kind, default_idx, devs[default_idx].get("name", "?"))
+            return default_idx
+    except Exception:
+        pass
+
+    # 3. Fall back to first available
+    if devs:
+        first_idx = sorted(devs.keys())[0]
+        logger.warning("No system default for %s — using first available: %d (%s)",
+                      kind, first_idx, devs[first_idx].get("name", "?"))
+        return first_idx
+
+    return None
+
+
 async def run_client() -> None:
     import websockets
 
     # Auto-select devices
     inputs, outputs = get_devices()
-    # PipeWire default = index 19 on this machine (128 in/out)
-    input_device = 19  # PipeWire default (routes to BT mic or built-in)
-    output_device = 19  # PipeWire default (routes to BT speaker)
+
+    # Log all available devices for debugging
+    logger.info("Available input devices: %s",
+                {i: d.get("name", "?") for i, d in inputs.items()})
+    logger.info("Available output devices: %s",
+                {i: d.get("name", "?") for i, d in outputs.items()})
+
+    # Resolve from env vars (JARVIS_INPUT_DEVICE, JARVIS_OUTPUT_DEVICE) or auto-detect
+    env_input = os.environ.get("JARVIS_INPUT_DEVICE")
+    env_output = os.environ.get("JARVIS_OUTPUT_DEVICE")
+    input_device = resolve_device(
+        int(env_input) if env_input else None,
+        "input", inputs, outputs,
+    )
+    output_device = resolve_device(
+        int(env_output) if env_output else None,
+        "output", inputs, outputs,
+    )
 
     logger.info("JARVIS Voice Client → %s", WS_URL)
-    logger.info("Input device: %d (%s)", input_device, inputs.get(input_device, {}).get("name", "?"))
-    logger.info("Output device: %d (%s)", output_device, outputs.get(output_device, {}).get("name", "?"))
+    if input_device is not None:
+        logger.info("Input device: %d (%s)", input_device, inputs.get(input_device, {}).get("name", "?"))
+    else:
+        logger.info("Input device: <system default>")
+    if output_device is not None:
+        logger.info("Output device: %d (%s)", output_device, outputs.get(output_device, {}).get("name", "?"))
+    else:
+        logger.info("Output device: <system default>")
 
     # ── Barge-in state (shared between mic capture, speaker, and main loop) ──
     tts_ref = TTSRefBuffer()
