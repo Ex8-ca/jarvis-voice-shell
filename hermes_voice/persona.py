@@ -100,6 +100,19 @@ def _load_voice_prompt() -> str:
         parts.append("\n\n# Recent Memory (from memex8)\n" + memex_block)
         logger.info("Voice prompt: included memex8 recall")
 
+    # Skill registry — discover what's installed under ~/.hermes/skills/ so
+    # the LLM can see both wired tools and unwired skills. Keep this BEFORE
+    # the assistant name suffix so it reads as reference material.
+    try:
+        from hermes_voice.skills_registry import render_for_prompt as _render_registry
+        registry_block = _render_registry()
+        if registry_block:
+            parts.append(registry_block)
+            logger.info("Voice prompt: included skill registry")
+    except Exception:
+        # Never let a registry failure break the voice pipeline
+        logger.exception("Voice prompt: skill registry failed (non-fatal)")
+
     from hermes_voice.naming import get_assistant_name
     name = get_assistant_name()
 
