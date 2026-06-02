@@ -146,6 +146,36 @@ async def _run_tool_loop(
         tool_name, tool_kwargs = parsed
         logger.info(f"Tool call (round {tool_round + 1}): {tool_name}({tool_kwargs})")
 
+        # LAZY REGISTRY INJECTION — on the first tool call of this process,
+        # load the full skill registry and tack it onto the system message
+        # so the LLM can see all registered (unwired) skills in its
+        # follow-up turn. The filler phrase below already masks the
+        # registry load + tool dispatch latency, so the user only hears
+        # "one second" once.
+        if tool_round == 0:
+            try:
+                from hermes_voice.skills_registry import (
+                    has_cached_registry,
+                    get_or_load_registry,
+                )
+                if not has_cached_registry():
+                    registry_block = get_or_load_registry()
+                    if registry_block and messages and messages[0].get("role") == "system":
+                        # Inject AFTER the existing system prompt so it
+                        # reads as additive context, not replacement.
+                        # The LLM sees the wired tools list first, then
+                        # the broader skill registry.
+                        messages[0]["content"] = (
+                            messages[0]["content"] + "\n\n" + registry_block
+                        )
+                        logger.info(
+                            f"Injected lazy skill registry into follow-up "
+                            f"system prompt ({len(registry_block)} chars)"
+                        )
+            except Exception:
+                # Never let a registry failure break the tool loop
+                logger.exception("Lazy registry injection failed (non-fatal)")
+
         # Send filler phrase to TTS immediately (masks tool latency)
         filler = pick_filler()
         if filler_tts_to_ws is not None:

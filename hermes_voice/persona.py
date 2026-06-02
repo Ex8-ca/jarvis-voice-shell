@@ -100,18 +100,26 @@ def _load_voice_prompt() -> str:
         parts.append("\n\n# Recent Memory (from memex8)\n" + memex_block)
         logger.info("Voice prompt: included memex8 recall")
 
-    # Skill registry — discover what's installed under ~/.hermes/skills/ so
-    # the LLM can see both wired tools and unwired skills. Keep this BEFORE
-    # the assistant name suffix so it reads as reference material.
+    # Skill registry — LAZY LOADED. The voice LLM gets a tiny stub here so
+    # it knows the registry exists, but the full ~11K manifest is NOT
+    # included in the system prompt. It gets injected on first tool call
+    # in `_run_tool_loop` (gated by a once-per-process flag), so most
+    # conversational turns never pay the cost.
     try:
-        from hermes_voice.skills_registry import render_for_prompt as _render_registry
-        registry_block = _render_registry()
-        if registry_block:
-            parts.append(registry_block)
-            logger.info("Voice prompt: included skill registry")
+        from hermes_voice.skills_registry import has_cached_registry
+        if not has_cached_registry():
+            parts.append(
+                "\n\n# Skills (lazy-loaded)\n\n"
+                "Wired tools are listed under `## Tools` below — call them with\n"
+                "`[[TOOL:name arg=\"value\"...]]` and the gateway will run them.\n\n"
+                "For broader awareness of the hundreds of registered skills installed\n"
+                "on this system, the gateway will load a manifest automatically the\n"
+                "first time you invoke a tool. You don't need to do anything; the\n"
+                "follow-up turn will see the full list. The first tool call is the\n"
+                "only one that has a slightly longer filler phrase (\"one second\")."
+            )
     except Exception:
-        # Never let a registry failure break the voice pipeline
-        logger.exception("Voice prompt: skill registry failed (non-fatal)")
+        logger.exception("Voice prompt: skills stub failed (non-fatal)")
 
     from hermes_voice.naming import get_assistant_name
     name = get_assistant_name()

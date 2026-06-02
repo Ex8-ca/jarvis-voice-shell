@@ -228,6 +228,42 @@ def mark_wired(entries: List[SkillEntry]) -> List[SkillEntry]:
 
 # ── Prompt rendering ───────────────────────────────────────────────────────
 
+# Module-level cache for lazy loading. The persona loader checks
+# `has_cached_registry()` to decide whether to inject the stub or skip
+# entirely. The gateway's `_run_tool_loop` calls `get_or_load_registry()`
+# on the first tool call and gets the same cached result on subsequent
+# calls. Cached for the lifetime of the process.
+_CACHED_REGISTRY: Optional[str] = None
+
+
+def has_cached_registry() -> bool:
+    """True if the registry has been loaded at least once this process."""
+    return _CACHED_REGISTRY is not None
+
+
+def get_or_load_registry() -> str:
+    """Return the rendered registry block, building and caching it on first
+    call. Subsequent calls are a dict lookup — no filesystem walk, no
+    frontmatter parsing. Empty string if the scan finds no skills.
+    """
+    global _CACHED_REGISTRY
+    if _CACHED_REGISTRY is None:
+        entries = mark_wired(discover_skills())
+        _CACHED_REGISTRY = render_for_prompt(entries)
+        logger.info(
+            f"Skill registry loaded (lazy): {len(_CACHED_REGISTRY)} chars, "
+            f"{len(entries)} entries"
+        )
+    return _CACHED_REGISTRY
+
+
+def invalidate_cache() -> None:
+    """Force the next call to re-scan. Useful for tests or when skills are
+    added at runtime (rare)."""
+    global _CACHED_REGISTRY
+    _CACHED_REGISTRY = None
+
+
 def render_for_prompt(
     entries: Optional[List[SkillEntry]] = None,
     show_unwired_descriptions: bool = False,
