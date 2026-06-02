@@ -1,0 +1,22 @@
+name: hermes-voice
+version: 1.0.0
+description: "Voice interface for Hermes Agent — real-time VAD, local Whisper STT, streaming LLM, and Edge TTS. Browser UI at port 8989 with barge-in support."
+author: Marc
+kind: service
+requires_env:
+  - name: DEEPSEEK_API_KEY
+    description: "DeepSeek API key for the voice LLM pipeline"
+    url: "https://platform.deepseek.com/"
+    password: true
+  - name: WHISPER_URL
+    description: "Local Whisper STT server URL (default: http://127.0.0.1:9001/v1/audio/transcriptions)"
+    password: false
+optional_env:
+  - name: HERMES_VOICE_PORT
+    description: "Port for the Hermes Voice web UI (default: 8989)"
+    password: false
+  - name: HERMES_NAME
+    description: "Assistant name used in the voice persona (default: Hermes)"
+    password: false
+provides_tools:
+  - hermes_voice_status
