@@ -37,7 +37,7 @@ from typing import Optional
 import numpy as np
 import sounddevice as sd
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 logger = logging.getLogger("hermes-voice-client")
 
@@ -222,15 +222,23 @@ class Speaker:
     async def _play_loop(self) -> None:
         def callback(outdata, frames, status, _):
             if status:
+                # status carries underflow/overflow flags. Log at debug
+                # to avoid spam, but a non-stop status here would mean
+                # the queue isn't keeping up.
                 logger.debug("speaker status: %s", status)
             try:
                 chunk = self._queue.get_nowait()
-                arr = np.frombuffer(chunk, dtype="<h")
-                if len(arr) < frames:
-                    arr = np.pad(arr, (0, frames - len(arr)))
-                outdata[:, 0] = arr[:frames].astype(np.float32) / 32768.0
             except asyncio.QueueEmpty:
-                outdata[:, 0] = 0.0
+                outdata.fill(0)
+                return
+            # dtype is int16, so write int16 directly — no float conversion.
+            arr = np.frombuffer(chunk, dtype="<i2").reshape(-1, AUDIO_CHANNELS)
+            if len(arr) < frames:
+                # Pad with silence if the chunk is shorter than the buffer.
+                pad = np.zeros((frames - len(arr), AUDIO_CHANNELS), dtype="<i2")
+                arr = np.concatenate([arr, pad])
+            # Truncate to exactly `frames` (callback-provided length).
+            outdata[:] = arr[:frames]
 
         self._stream = sd.OutputStream(
             device=self.device,
@@ -247,7 +255,13 @@ class Speaker:
     async def play(self, mp3_data: bytes) -> None:
         pcm = decode_mp3(mp3_data)
         if not pcm:
+            logger.warning("play() called with empty PCM (MP3 decode produced 0 bytes)")
             return
+        duration_s = len(pcm) / (SPEAKER_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH)
+        logger.info(
+            "Playing TTS: %d bytes PCM (%.2fs @ %dHz, mono)",
+            len(pcm), duration_s, SPEAKER_SAMPLE_RATE,
+        )
         # Send in chunks of ~50ms worth of samples (at the speaker's rate).
         chunk_size = SPEAKER_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH // 20
         for i in range(0, len(pcm), chunk_size):
