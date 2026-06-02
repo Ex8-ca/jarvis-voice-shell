@@ -409,11 +409,32 @@ async def voice_websocket(ws: WebSocket):
                     logger.info(f"Skipping small chunk: {len(data)}B")
                     continue
 
+                # While TTS is playing, the mic is picking up AI audio bleed.
+                # The server-side VAD was self-triggering from speaker bleed
+                # and prematurely cancelling the in-flight response. Two fixes:
+                #   1. While current_task is still running (LLM/TTS in flight),
+                #      bump the VAD threshold 3x so it doesn't fire on the
+                #      AI's own voice coming through speakers.
+                #   2. The client also sends an explicit "barge_in" control
+                #      message on mic activity during TTS (see hermes_voice_client
+                #      v0.2.0). That always works regardless of audio levels.
+                tts_active = bool(current_task) and not current_task.done()
+                vad_threshold_override = _vad_threshold * 3 if tts_active else None
+
                 old_state = vad.state.value
-                segment = vad.process(data)
+                if vad_threshold_override is not None:
+                    # Temporarily override threshold for this single frame.
+                    saved = vad.energy_threshold
+                    vad.energy_threshold = vad_threshold_override
+                    try:
+                        segment = vad.process(data)
+                    finally:
+                        vad.energy_threshold = saved
+                else:
+                    segment = vad.process(data)
                 new_state = vad.state.value
                 if new_state != old_state:
-                    logger.info(f"VAD state: {old_state} → {new_state} (chunk {len(data)}B, RMS={rms_int16(data)})")
+                    logger.info(f"VAD state: {old_state} → {new_state} (chunk {len(data)}B, RMS={rms_int16(data)}, tts_active={tts_active})")
 
                 if new_state != old_state:
                     await ws.send_json({"type": "vad_state", "state": new_state})

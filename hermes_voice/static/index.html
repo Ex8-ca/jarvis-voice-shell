@@ -305,11 +305,12 @@
                                 showStatus('Processing...', 'thinking');
                             } else if (msg.state === 'speaking') {
                                 showStatus('Speaking...', 'speaking');
-                                // BARGE-IN: server VAD triggered while AI is still talking
-                                // → user is interrupting. Cancel TTS + in-flight LLM.
-                                // DEBUG: temporarily log state to diagnose false barge-in
-                                console.log(`[barge-in check] ttsIsPlaying=${ttsIsPlaying} msg.state=${msg.state}`);
-                                if (false && ttsIsPlaying) {  // DEBUG: disabled to test
+                                // BARGE-IN: server VAD triggered while AI is still talking.
+                                // The browser uses acoustic echo cancellation (subtracts
+                                // TTS reference from mic), so this should only fire on
+                                // real user speech. If we see false triggers, raise
+                                // WW_RMS_THRESHOLD in the wake-word section.
+                                if (ttsIsPlaying) {
                                     console.log('Barge-in detected — interrupting AI');
                                     stopTtsPlayback();
                                     if (ws.readyState === WebSocket.OPEN) {
