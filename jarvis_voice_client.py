@@ -33,6 +33,7 @@ import queue
 import signal
 import sys
 import threading
+import time
 from typing import Optional
 
 import sounddevice as sd
@@ -117,10 +118,16 @@ class MicCapture:
         # - is_sidetoning: True if TTS ref was subtracted on the last frame
         self.last_clean_rms: float = 0.0
         self.is_sidetoning: bool = False
+        # Mute flag — when True, mic frames are dropped (TTS is playing)
+        self._muted: bool = False
 
     def attach_tts_ref(self, tts_ref_buffer) -> None:
         """Attach a TTS reference buffer for sidetone cancellation."""
         self._tts_ref = tts_ref_buffer
+
+    def set_muted(self, muted: bool) -> None:
+        """Mute mic capture (e.g. while TTS is playing) to prevent echo."""
+        self._muted = muted
 
     def start(self) -> None:
         self._running = True
@@ -145,6 +152,13 @@ class MicCapture:
     def _on_frame(self, indata: np.ndarray, frames: int, status: sd.CallbackFlags, _):
         if status:
             logger.debug("capture status: %s", status)
+        # Drop frames while TTS is playing — prevents AI's audio from
+        # bleeding speakers→mic and being re-transcribed as a new turn.
+        if self._muted:
+            if not hasattr(self, '_mute_log_last') or time.monotonic() - self._mute_log_last > 2.0:
+                logger.info("mic: frame DROPPED (muted, RMS=%.0f)", np.sqrt(np.mean(indata**2)))
+                self._mute_log_last = time.monotonic()
+            return
         try:
             # indata shape: (frames, channels) — mono so [:, 0]
             mic = indata[:, 0].astype(np.int32)  # int32 for arithmetic headroom
@@ -168,6 +182,11 @@ class MicCapture:
 
             # Compute RMS for barge-in detection (on cleaned signal)
             self.last_clean_rms = float(np.sqrt(np.mean(mic_int16.astype(np.float32) ** 2)))
+
+            # Log when frame is sent (rate-limited)
+            if not hasattr(self, '_send_log_last') or time.monotonic() - self._send_log_last > 2.0:
+                logger.info("mic: frame SENT (RMS=%.0f, muted=%s)", self.last_clean_rms, self._muted)
+                self._send_log_last = time.monotonic()
 
             self._queue.put_nowait(pcm)
         except queue.Full:
@@ -304,10 +323,22 @@ class Speaker:
         # Set True while TTS audio is on the queue or playing
         self._is_playing_tts = False
         self._playback_lock = threading.Lock()
+        # Optional callback to mute/unmute the mic during TTS playback
+        self._mic_muter = None
 
     def attach_tts_ref(self, tts_ref_buffer) -> None:
         """Attach a TTS reference buffer for sidetone cancellation."""
         self._tts_ref = tts_ref_buffer
+
+    def set_mic_muter(self, muter) -> None:
+        """Register a callable `muter(muted: bool)` to mute/unmute the mic.
+
+        The speaker mutes the mic when its `play()` is called and unmutes
+        when the audio is **fully drained from the playback queue** —
+        not when the WebSocket says the turn is done, because there's
+        often several seconds of buffered audio still playing.
+        """
+        self._mic_muter = muter
 
     async def start(self) -> None:
         self._running = True
@@ -337,7 +368,7 @@ class Speaker:
             channels=AUDIO_CHANNELS,
             samplerate=AUDIO_SAMPLE_RATE,
             blocksize=2048,
-            dtype="int16",
+            dtype="float32",  # matches callback which writes float32 in [-1, 1]
             callback=callback,
         )
         with self._stream:
@@ -345,7 +376,11 @@ class Speaker:
                 await asyncio.sleep(0.05)
 
     async def play(self, mp3_data: bytes) -> None:
-        pcm = decode_mp3(mp3_data)
+        # Run MP3 decode in a thread so the event loop doesn't block.
+        # decode_mp3 is CPU-bound and can take 50-200ms for a few seconds of audio —
+        # blocking the loop during that time causes PortAudio's callback to underrun
+        # (silence gaps = choppy playback).
+        pcm = await asyncio.to_thread(decode_mp3, mp3_data)
         if not pcm:
             return
         pcm_int16 = np.frombuffer(pcm, dtype="<h")
@@ -357,10 +392,42 @@ class Speaker:
         with self._playback_lock:
             self._is_playing_tts = True
 
-        # Send in chunks of ~50ms worth of samples
-        chunk_size = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_SAMPLE_WIDTH // 20  # 50ms
+        # Mute the mic while TTS plays — prevents echo feedback loop.
+        # Done here (when audio is about to be queued) rather than on the
+        # `speaking` server message, because the server's "done" arrives
+        # when TTS **generation** finishes, but audio may still be queued
+        # and playing for several seconds after.
+        if self._mic_muter is not None:
+            try:
+                self._mic_muter(True)
+            except Exception as e:
+                logger.debug("mic mute failed: %s", e)
+
+        # Send in chunks matching the PortAudio blocksize (2048 samples = 4096 bytes
+        # = 128ms at 16kHz mono int16). Mismatched sizes cause PortAudio to
+        # pad with zeros → choppy/buzzy playback.
+        chunk_size = 4096  # = 2048 samples × 2 bytes (matches OutputStream blocksize)
         for i in range(0, len(pcm), chunk_size):
             await self._queue.put(pcm[i:i + chunk_size])
+            # Yield to let the PortAudio callback pull. Without this, the asyncio
+            # event loop starves and we get buffer underruns.
+            await asyncio.sleep(0.005)
+
+        # Wait for queue to drain so subsequent turns don't overlap
+        while not self._queue.empty():
+            await asyncio.sleep(0.05)
+
+        # Unmute the mic only when **all** queued audio has been played.
+        # The `done` server message can fire while audio is still in the
+        # queue (TTS finished generating, but not yet played).
+        if self._mic_muter is not None:
+            try:
+                self._mic_muter(False)
+            except Exception as e:
+                logger.debug("mic unmute failed: %s", e)
+
+        with self._playback_lock:
+            self._is_playing_tts = False
 
     async def stop(self) -> None:
         self._running = False
@@ -477,6 +544,10 @@ async def run_client() -> None:
     mic = MicCapture(device=input_device)
     mic.attach_tts_ref(tts_ref)
     mic.start()
+    # Speaker mutes the mic while TTS is playing (and unmutes when the
+    # audio is fully drained from the queue, not when the server says
+    # `done` — that can fire 5-10s before playback finishes).
+    speaker.set_mic_muter(mic.set_muted)
 
     # Server-driven TTS state: the server tells us when TTS is starting
     # (via `speaking` message) and when the turn is done (via `done`).
@@ -519,7 +590,8 @@ async def run_client() -> None:
                             continue
                         # Only fire barge-in on the *cleaned* mic RMS
                         # (after sidetone subtraction, the AI's voice is gone)
-                        if mic.is_sidetoning and mic.last_clean_rms > BARGE_IN_RMS:
+                        # DISABLED: barge-in fires too aggressively — keep TTS flowing
+                        if False and mic.is_sidetoning and mic.last_clean_rms > BARGE_IN_RMS:
                             barge_in_fired = True
                             logger.info(
                                 "🚨 Barge-in! clean RMS=%.0f > %d — interrupting AI",
@@ -535,10 +607,19 @@ async def run_client() -> None:
                 # Receive server messages + audio
                 async def recv_messages():
                     nonlocal server_says_ai_speaking, barge_in_fired
+                    mp3_buffer = bytearray()
                     async for msg in ws:
                         if isinstance(msg, str):
+                            # Flush any buffered MP3 when a new turn starts
+                            # (e.g., we got a transcript or vad_state change indicating
+                            # a new user utterance, so the previous TTS is done.)
                             data = json.loads(msg)
                             t = data.get("type", "")
+                            if t in ("vad_state", "transcript", "response_complete", "speaking", "error"):
+                                if mp3_buffer:
+                                    logger.info(f"Flushing {len(mp3_buffer)}B buffered MP3 (interrupted by {t})")
+                                    await speaker.play(bytes(mp3_buffer))
+                                    mp3_buffer = bytearray()
                             if t == "vad_state":
                                 s = data.get("state", "")
                                 logger.info({"idle": "🎙 Listening...", "processing": "⏳ Thinking...", "speaking": "🔊 Speaking..."}.get(s, s))
@@ -549,12 +630,27 @@ async def run_client() -> None:
                             elif t == "speaking":
                                 logger.info("🔊 Speaking...")
                                 server_says_ai_speaking = True
+                                # (Mic muting is now driven by Speaker.play()
+                                # at the actual audio boundary, not here — the
+                                # server's `done` message fires when TTS generation
+                                # finishes, but audio can still be queued for
+                                # several seconds after.)
                             elif t == "barge_in_ack":
                                 logger.info("✅ Server acked barge-in")
                                 server_says_ai_speaking = False
                                 barge_in_fired = False
                                 # Belt-and-suspenders: make sure local TTS is stopped
                                 speaker.stop_immediately()
+                                # Stop_immediately doesn't trigger the unmute
+                                # callback (it bypasses the play() flow), so
+                                # unmute explicitly here.
+                                if speaker._mic_muter is not None:
+                                    try:
+                                        speaker._mic_muter(False)
+                                    except Exception:
+                                        pass
+                                if mp3_buffer:
+                                    mp3_buffer = bytearray()
                             elif t == "done":
                                 total = data.get("total_ms", 0)
                                 stt = data.get("stt_ms", 0)
@@ -563,10 +659,22 @@ async def run_client() -> None:
                                 logger.info(f"✅ Turn complete — STT:{stt}ms LLM:{llm}ms TTS:{tts}ms Total:{total}ms")
                                 server_says_ai_speaking = False
                                 barge_in_fired = False
+                                # Mic unmute is handled by Speaker.play() when
+                                # the audio is actually drained from the queue.
+                                # Flush accumulated MP3 now that stream is complete
+                                if mp3_buffer:
+                                    logger.info(f"Decoding {len(mp3_buffer)}B MP3 → PCM")
+                                    await speaker.play(bytes(mp3_buffer))
+                                    mp3_buffer = bytearray()
                             elif t == "error":
                                 logger.error("⚠ %s", data.get("text", ""))
+                                if mp3_buffer:
+                                    mp3_buffer = bytearray()
                         elif isinstance(msg, bytes):
-                            await speaker.play(msg)
+                            # Buffer MP3 chunks — Edge TTS sends them as small
+                            # frames (~100ms each). We must decode the full MP3
+                            # stream, not individual frames.
+                            mp3_buffer.extend(msg)
 
                 await asyncio.gather(send_frames(), recv_messages(), barge_in_watcher())
 

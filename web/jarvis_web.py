@@ -536,7 +536,9 @@ async def index():
                                 showStatus('Speaking...', 'speaking');
                                 // BARGE-IN: server VAD triggered while AI is still talking
                                 // → user is interrupting. Cancel TTS + in-flight LLM.
-                                if (ttsIsPlaying) {
+                                // DEBUG: temporarily log state to diagnose false barge-in
+                                console.log(`[barge-in check] ttsIsPlaying=${ttsIsPlaying} msg.state=${msg.state}`);
+                                if (false && ttsIsPlaying) {  // DEBUG: disabled to test
                                     console.log('Barge-in detected — interrupting AI');
                                     stopTtsPlayback();
                                     if (ws.readyState === WebSocket.OPEN) {
@@ -1015,6 +1017,7 @@ async def voice_websocket(ws: WebSocket):
                         continue
                     if ctrl.get("type") == "barge_in":
                         # User spoke while AI was responding — cancel in-flight task
+                        logger.info(f"Barge-in received: current_task.done()={current_task.done() if current_task else 'no task'}, processing={processing}")
                         if current_task and not current_task.done():
                             current_task.cancel()
                             logger.info("Barge-in: cancelled in-flight LLM/TTS task")
@@ -1033,12 +1036,18 @@ async def voice_websocket(ws: WebSocket):
 
                 # Binary = PCM audio chunk
                 data = msg.get("bytes")
-                if not data or len(data) < SAMPLES_PER_FRAME * 2:
+                if not data:
+                    logger.info(f"Non-binary msg: {msg.get('type')}")
+                    continue
+                if len(data) < SAMPLES_PER_FRAME * 2:
+                    logger.info(f"Skipping small chunk: {len(data)}B")
                     continue
 
                 old_state = vad.state.value
                 segment = vad.process(data)
                 new_state = vad.state.value
+                if new_state != old_state:
+                    logger.info(f"VAD state: {old_state} → {new_state} (chunk {len(data)}B, RMS={rms_int16(data)})")
 
                 if new_state != old_state:
                     await ws.send_json({"type": "vad_state", "state": new_state})
@@ -1068,6 +1077,14 @@ async def voice_websocket(ws: WebSocket):
                     processing = True
                     await ws.send_json({"type": "vad_state", "state": "processing"})
                     current_task = asyncio.create_task(process_segment(final_audio))
+                    def _on_done(t):
+                        if t.cancelled():
+                            logger.warning("process_segment was CANCELLED — TTS may not have run")
+                        elif t.exception():
+                            logger.exception(f"process_segment raised: {t.exception()}")
+                        else:
+                            logger.info("process_segment completed normally")
+                    current_task.add_done_callback(_on_done)
 
                 if vad.state == VADState.IDLE:
                     speech_buffer = []
@@ -1177,6 +1194,7 @@ async def voice_websocket(ws: WebSocket):
                 return
 
         llm_ms = (time.perf_counter() - llm_start) * 1000
+        logger.info(f"LLM streaming complete: {len(full_response)} chars in {llm_ms:.0f}ms")
 
         if not full_response:
             await ws.send_json({"type": "error", "text": "Empty response"})
