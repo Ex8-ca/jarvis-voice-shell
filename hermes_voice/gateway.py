@@ -354,6 +354,15 @@ async def voice_websocket(ws: WebSocket):
     processing = False
     current_task: asyncio.Task | None = None
 
+    # Post-TTS grace window. When the in-flight task finishes (LLM done,
+    # TTS stream complete), VAD stays at 10x for this many extra seconds
+    # so the echo tail of the last word + any brief speaker decay doesn't
+    # immediately re-trigger a new "speaking → idle" segment that would
+    # cancel the just-finished response. 0.8s covers the typical
+    # room-reverb tail of a normal voice.
+    POST_TTS_GRACE_S = float(_os.environ.get("HERMES_POST_TTS_GRACE_S", "0.8"))
+    _post_tts_grace_until: float | None = None
+
     # Interim STT tracking
     speech_buffer: list[bytes] = []
     interim_seq = 0
@@ -400,7 +409,7 @@ async def voice_websocket(ws: WebSocket):
 
     async def receive_loop():
         """Continuously receive PCM chunks and control messages from browser."""
-        nonlocal speech_buffer, interim_seq, last_interim_send, processing, current_task
+        nonlocal speech_buffer, interim_seq, last_interim_send, processing, current_task, _post_tts_grace_until
 
         try:
             while True:
@@ -445,15 +454,31 @@ async def voice_websocket(ws: WebSocket):
 
                 # While TTS is playing, the mic is picking up AI audio bleed.
                 # The server-side VAD was self-triggering from speaker bleed
-                # and prematurely cancelling the in-flight response. Two fixes:
+                # and prematurely cancelling the in-flight response. Three fixes:
                 #   1. While current_task is still running (LLM/TTS in flight),
-                #      bump the VAD threshold 3x so it doesn't fire on the
-                #      AI's own voice coming through speakers.
-                #   2. The client also sends an explicit "barge_in" control
+                #      bump the VAD threshold 10x so it doesn't fire on the
+                #      AI's own voice coming through speakers. Observed bleed
+                #      RMS during TTS has been 8K-14K (with 3x = 4500 still
+                #      firing), so 10x = 15K comfortably covers it.
+                #   2. After TTS finishes, hold off on VAD-driven segment
+                #      firing for a short grace period (POST_TTS_GRACE_S) so
+                #      the echo tail of the last word doesn't trigger a new
+                #      turn.
+                #   3. The client also sends an explicit "barge_in" control
                 #      message on mic activity during TTS (see hermes_voice_client
-                #      v0.2.0). That always works regardless of audio levels.
+                #      v0.2.0). That always works regardless of audio levels
+                #      and is the only way to interrupt mid-response.
                 tts_active = bool(current_task) and not current_task.done()
-                vad_threshold_override = _vad_threshold * 3 if tts_active else None
+                if tts_active:
+                    vad_threshold_override = _vad_threshold * 10
+                elif (
+                    _post_tts_grace_until is not None
+                    and time.monotonic() < _post_tts_grace_until
+                ):
+                    # In the post-TTS echo window — keep threshold at 10x
+                    vad_threshold_override = _vad_threshold * 10
+                else:
+                    vad_threshold_override = None
 
                 old_state = vad.state.value
                 if vad_threshold_override is not None:
@@ -489,6 +514,11 @@ async def voice_websocket(ws: WebSocket):
                         current_task.cancel()
                         logger.info("Cancelled previous processing task — new speech detected")
 
+                    # Clear any stale post-TTS grace — a real segment
+                    # has just fired, so the grace is no longer relevant
+                    # (the user's actual voice ended it).
+                    _post_tts_grace_until = None
+
                     # Invalidate pending interim requests
                     interim_seq += 1
                     # Use accumulated speech buffer if we have it, otherwise VAD segment
@@ -499,12 +529,19 @@ async def voice_websocket(ws: WebSocket):
                     await ws.send_json({"type": "vad_state", "state": "processing"})
                     current_task = asyncio.create_task(process_segment(final_audio))
                     def _on_done(t):
+                        nonlocal _post_tts_grace_until
                         if t.cancelled():
                             logger.warning("process_segment was CANCELLED — TTS may not have run")
                         elif t.exception():
                             logger.exception(f"process_segment raised: {t.exception()}")
                         else:
                             logger.info("process_segment completed normally")
+                        # Arm the post-TTS grace window regardless of how the
+                        # task ended (cancelled, errored, or normal) — the
+                        # VAD-driven receiver is the same code path and we
+                        # want the same protection.
+                        _post_tts_grace_until = time.monotonic() + POST_TTS_GRACE_S
+                        logger.debug(f"Post-TTS grace armed for {POST_TTS_GRACE_S}s")
                     current_task.add_done_callback(_on_done)
 
                 if vad.state == VADState.IDLE:
