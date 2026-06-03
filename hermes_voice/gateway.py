@@ -57,6 +57,10 @@ from hermes_voice.tools import parse_tool_call, strip_tool_call  # noqa: E402
 
 app = FastAPI(title="Hermes Voice Web")
 
+# Process start time (for /health uptime reporting)
+import time as _time
+_STARTUP_TIME = _time.time()
+
 
 # Voice system prompt is loaded by the `persona` module (see persona.py).
 # Resolution order: HERMES_VOICE_PROMPT_FILE → ~/.hermes/VOICE.md → ~/.hermes/SOUL.md
@@ -797,6 +801,61 @@ async def voice_websocket(ws: WebSocket):
 
 
 # ── Chat endpoints ────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    """Liveness + dependency health.
+
+    Returns:
+      - status: "ok" if everything is responding, "degraded" if a dep is down
+      - uptime_s: seconds since this process started
+      - whisper: "ok" | "down" | "unknown"
+      - whisper_url: the WHISPER_URL we're configured to call
+      - port: the port this gateway is bound to
+      - tier: best-effort tier hint (e.g. "gpu", "cpu"); empty if not detected
+
+    Cheap to call — no model load, no transcription, just an HTTP GET to
+    Whisper (404 from / is fine — we just want to know it's listening).
+    """
+    import httpx
+
+    whisper_url = os.environ.get("WHISPER_URL", WHISPER_URL)
+    port = int(os.environ.get("HERMES_VOICE_PORT", "7979"))
+    uptime_s = round(_time.time() - _STARTUP_TIME, 1)
+
+    # Probe Whisper — any 2xx/4xx/5xx response means it's up. Timeout/connect
+    # error means it's down. We use a short timeout to keep /health snappy.
+    whisper_status = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            # Hit the base URL of WHISPER_URL (strip /v1/audio/transcriptions)
+            base = whisper_url.split("/v1")[0]
+            resp = await client.get(base)
+            whisper_status = "ok" if resp.status_code < 500 else "down"
+    except Exception:
+        whisper_status = "down"
+
+    # Best-effort tier detection from a marker file start-all.sh may leave.
+    # Format: just a single word on the first line ("gpu", "cpu", "apple").
+    tier = ""
+    try:
+        marker = Path("/tmp/hermes-voice-tier")
+        if marker.exists():
+            tier = marker.read_text().strip().splitlines()[0].strip()
+    except Exception:
+        pass
+
+    overall = "ok" if whisper_status == "ok" else "degraded"
+    return {
+        "status": overall,
+        "uptime_s": uptime_s,
+        "whisper": whisper_status,
+        "whisper_url": whisper_url,
+        "port": port,
+        "tier": tier,
+        "version": "0.1.0",
+    }
+
 
 @app.get("/chat")
 async def chat_get(text: str):

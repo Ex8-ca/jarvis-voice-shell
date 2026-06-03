@@ -30,6 +30,19 @@ logger = logging.getLogger("hermes-voice.plugin")
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Load the plugin's own .env BEFORE reading any env-driven defaults.
+# The gateway.py module also loads .env, but this __init__.py needs the
+# values at import time (DEFAULT_PORT, etc.) so the plugin can decide
+# whether to auto-start. We use override=False so a shell-exported env
+# var still wins.
+try:
+    from dotenv import load_dotenv
+    _plugin_env = Path(__file__).resolve().parent / ".env"
+    if _plugin_env.exists():
+        load_dotenv(_plugin_env, override=False)
+except ImportError:
+    pass
+
 DEFAULT_PORT = int(os.environ.get("HERMES_VOICE_PORT", "8989"))
 _SERVER_URL = f"http://127.0.0.1:{DEFAULT_PORT}"
 
@@ -97,6 +110,26 @@ def start_server(*, port: Optional[int] = None, quiet: bool = True) -> bool:
 
     logger.info("Starting hermes-voice server: %s", " ".join(cmd[:4]))
 
+    # Best-effort tier marker — start-all.sh writes this with proper detection
+    # ("gpu" / "apple" / "cpu"). The plugin's auto-start path doesn't have
+    # access to start-all.sh, so probe for nvidia-smi quickly. If nvidia-smi
+    # is unavailable, leave the marker alone (gateway will report "unknown").
+    if not Path("/tmp/hermes-voice-tier").exists():
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                timeout=2, stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if out:
+                Path("/tmp/hermes-voice-tier").write_text("gpu")
+            else:
+                Path("/tmp/hermes-voice-tier").write_text("cpu")
+        except Exception:
+            try:
+                Path("/tmp/hermes-voice-tier").write_text("cpu")
+            except Exception:
+                pass
+
     try:
         if quiet:
             _server_process = subprocess.Popen(
@@ -159,13 +192,45 @@ def restart_server(*, port: Optional[int] = None) -> bool:
 
 
 def get_server_status() -> dict:
-    """Return the current voice server status."""
+    """Return the current voice server status.
+
+    Hits /health (if server is responding) for a richer report — whisper
+    liveness, uptime, tier. Falls back to a minimal "port only" dict if
+    the server is not responding (e.g. stopped, or starting up).
+    """
+    import json as _json
+    import urllib.request
+    import urllib.error
+
     port = DEFAULT_PORT
+    base = f"http://127.0.0.1:{port}"
+
+    if _port_in_use(port) and _is_server_responding(port):
+        try:
+            with urllib.request.urlopen(f"{base}/health", timeout=2) as resp:
+                payload = _json.loads(resp.read().decode("utf-8"))
+            return {
+                "running": True,
+                "port": port,
+                "url": base,
+                "pid": _server_process.pid if _server_process else None,
+                "whisper": payload.get("whisper", "unknown"),
+                "uptime_s": payload.get("uptime_s", 0),
+                "tier": payload.get("tier", ""),
+                "version": payload.get("version", ""),
+            }
+        except (urllib.error.URLError, OSError, ValueError):
+            pass  # fall through to minimal report
+
     return {
-        "running": _is_server_responding(port),
+        "running": False,
         "port": port,
-        "url": f"http://127.0.0.1:{port}",
+        "url": base,
         "pid": _server_process.pid if _server_process else None,
+        "whisper": "down",
+        "uptime_s": 0,
+        "tier": "",
+        "version": "",
     }
 
 
@@ -197,11 +262,10 @@ def _handle_voice_status(args: dict, **kwargs) -> str:
 # Slash command: /hermes-voice
 # ---------------------------------------------------------------------------
 
-_VOICE_CMD_HELP = """\
-/hermes-voice — Manage the Hermes Voice server
+_VOICE_CMD_HELP = f"""/hermes-voice — Manage the Hermes Voice server
 
 Subcommands:
-  start [port]     — Start the voice server (default port: 8989)
+  start [port]     — Start the voice server (default port: {DEFAULT_PORT})
   stop             — Stop the voice server
   restart [port]   — Restart the voice server
   status           — Show server status
@@ -232,10 +296,24 @@ def _handle_voice_command(raw_args: str) -> Optional[str]:
 
     if sub == "status":
         status = get_server_status()
-        lines = ["Hermes Voice Server:"]
-        lines.append(f"  Running: {'Yes' if status['running'] else 'No'}")
-        lines.append(f"  URL: {status['url']}")
-        lines.append(f"  PID: {status['pid'] or 'N/A'}")
+        if status["running"]:
+            lines = [
+                "Hermes Voice Server:",
+                f"  Running: Yes",
+                f"  URL: {status['url']}",
+                f"  PID: {status['pid'] or 'N/A'}",
+                f"  Whisper: {status['whisper']}",
+                f"  Uptime: {status['uptime_s']}s",
+                f"  Tier: {status['tier'] or 'unknown'}",
+                f"  Version: {status['version'] or 'unknown'}",
+            ]
+        else:
+            lines = [
+                "Hermes Voice Server:",
+                f"  Running: No",
+                f"  Port: {status['port']} (not listening)",
+                f"  Start with: /hermes-voice start",
+            ]
         return "\n".join(lines)
 
     return _VOICE_CMD_HELP

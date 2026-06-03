@@ -83,6 +83,19 @@ detect_tier() {
 TIER_INFO=$(detect_tier)
 TIER=$(echo "$TIER_INFO" | cut -d: -f1)
 DETAIL=$(echo "$TIER_INFO" | cut -d: -f2-)
+
+# Write a tier marker for the gateway's /health endpoint to read.
+# Format: just one word on the first line (gpu | apple | cpu).
+case "$TIER" in
+    TIER3|TIER2) echo "gpu" > /tmp/hermes-voice-tier ;;
+    TIER1)
+        if echo "$DETAIL" | grep -qi "apple"; then
+            echo "apple" > /tmp/hermes-voice-tier
+        else
+            echo "cpu" > /tmp/hermes-voice-tier
+        fi
+        ;;
+esac
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 case "$TIER" in
     TIER3)
