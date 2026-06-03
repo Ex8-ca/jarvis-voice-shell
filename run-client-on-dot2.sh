@@ -7,7 +7,7 @@
 set -e
 source ~/hermes-voice-client/venv/bin/activate
 export HERMES_WS_HOST="192.168.1.3"
-export HERMES_WS_PORT="8989"
+export HERMES_WS_PORT="7979"   # was 8989, now taken by audioforge
 export HERMES_INPUT_DEVICE="7"   # pipewire default - follows active BT mic
 export HERMES_OUTPUT_DEVICE="7"  # pipewire default - follows active BT speaker
 export HERMES_LOG_LEVEL="DEBUG"

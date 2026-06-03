@@ -369,6 +369,18 @@ async def voice_websocket(ws: WebSocket):
     _post_tts_grace_until: float | None = None
 
     # Interim STT tracking
+    # Interim STT (every 500ms while speaking) overwhelms CPU Whisper by
+    # queuing 16+ parallel calls per 8s utterance. On GPU (~0.4s/req) this
+    # is fine and gives the user partial transcripts as they talk. Off by
+    # default for safety (CPU deployments); auto-enable when CUDA is up.
+    try:
+        import ctranslate2
+        _gpu_available = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        _gpu_available = False
+    INTERIM_STT_ENABLED = _os.environ.get("HERMES_INTERIM_STT") or (
+        "1" if _gpu_available else "0"
+    )
     speech_buffer: list[bytes] = []
     interim_seq = 0
     last_interim_send = 0.0
@@ -503,15 +515,19 @@ async def voice_websocket(ws: WebSocket):
                 if new_state != old_state:
                     await ws.send_json({"type": "vad_state", "state": new_state})
 
-                # During speech: send periodic interim STT
+                # During speech: buffer audio + send periodic interim STT.
+                # Interim STT is disabled by default (CPU Whisper can't keep up
+                # with 16 parallel calls per 8s utterance). Set HERMES_INTERIM_STT=1
+                # to re-enable for GPU deployments.
                 if vad.state == VADState.SPEAKING:
                     speech_buffer.append(data)
-                    now = time.monotonic()
-                    if now - last_interim_send > INTERIM_INTERVAL:
-                        last_interim_send = now
-                        interim_seq += 1
-                        audio_snapshot = b"".join(speech_buffer)
-                        asyncio.create_task(send_interim_stt(audio_snapshot, interim_seq))
+                    if INTERIM_STT_ENABLED:
+                        now = time.monotonic()
+                        if now - last_interim_send > INTERIM_INTERVAL:
+                            last_interim_send = now
+                            interim_seq += 1
+                            audio_snapshot = b"".join(speech_buffer)
+                            asyncio.create_task(send_interim_stt(audio_snapshot, interim_seq))
 
                 if segment:
                     # Speech segment complete — cancel any in-progress processing
@@ -589,6 +605,7 @@ async def voice_websocket(ws: WebSocket):
                     )
                 stt_resp.raise_for_status()
                 stt_data = stt_resp.json()
+            logger.info(f"STT raw response: {stt_data!r}")
             transcript = stt_data.get("text", "").strip()
         except httpx.ConnectError:
             await ws.send_json({"type": "error", "text": "Whisper not ready — model loading"})
@@ -659,6 +676,7 @@ async def voice_websocket(ws: WebSocket):
             processing = False
             return
 
+        logger.info(f"LLM response: {full_response!r}")
         await ws.send_json({"type": "response_complete", "text": full_response, "llm_ms": llm_ms})
 
         # ── Step 2.5: Tool dispatch (if LLM requested a tool) ─────
@@ -719,6 +737,7 @@ async def voice_websocket(ws: WebSocket):
         # Notify clients that audio is starting. Send both:
         #   - "speaking" (legacy, for old clients that listen for it)
         #   - "tts_playing" with playing=true (canonical, used by barge-in)
+        logger.info(f"TTS starting for response: {full_response!r}")
         try:
             await ws.send_json({"type": "speaking"})
         except WebSocketDisconnect:
@@ -881,5 +900,7 @@ async def get_audio(filename: str):
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8989)
+    port = int(os.environ.get("HERMES_VOICE_PORT", "7979"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
