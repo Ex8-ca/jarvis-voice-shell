@@ -12,6 +12,7 @@ Real-time voice pipeline for Hermes Agent. Streaming STT → streaming LLM → s
 - **Filler phrases** ("One sec...", "Checking...") play the instant you stop talking, so the AI's pause feels like thinking, not lag
 - **Edge TTS** streams MP3 chunks back to the client as they synthesize (no waiting for the full audio)
 - **Barge-in** — interrupt the AI mid-response by talking over it
+- **Hardware tier auto-detection** — CPU, modern GPU, and Apple Silicon paths are picked automatically. See [Hardware tiers](#hardware-tiers).
 - **Two deployment modes** — single-machine (web UI) or split-architecture (Python client on your desktop, gateway on a server)
 - **Docker** — one-command deploy with optional GPU
 
@@ -193,19 +194,107 @@ For most users, **Groq with `llama-3.1-8b-instant`** is the sweet spot. Free, fa
 
 ## Latency budget
 
-Typical end-to-end (you-stop-talking → first response audio byte):
+End-to-end latency from "you stop talking" to "first response audio byte":
 
-| Component | Time |
-|-----------|------|
-| VAD end-silence | 315ms |
-| Whisper STT | ~400ms |
-| Filler phrase playback | ~600ms (overlaps with LLM) |
-| LLM first token (Groq) | ~150ms |
-| LLM full response | ~800ms |
-| TTS first chunk | ~400ms |
-| **Perceived latency** | **~1.0s** (filler masks LLM) |
+| Component | CPU tier (no GPU) | GPU tier (8GB+ VRAM) |
+|-----------|-------------------|----------------------|
+| VAD end-silence | 1.5s | 1.5s |
+| Whisper STT (per 1s of audio) | ~9s | **~0.4s** |
+| LLM first token (Groq) | ~150ms | ~150ms |
+| LLM full response | ~800ms | ~800ms |
+| TTS first chunk | ~400ms | ~400ms |
+| **Total per 1s of speech** | **~12s** | **~3s** |
+| **Perceived (filler masks LLM)** | **~10s** | **~2.5s** |
 
-The filler phrase ("One sec...") starts playing the moment Whisper returns, before the LLM has even started — so the user perceives ~1s total instead of ~2s.
+**Why the gap is so big:** Whisper is the bottleneck. On CPU it does roughly 1x realtime (1s of audio takes 1s to process). On a modern GPU with `ctranslate2>=4.7.2` it does 30x realtime (1s of audio takes 0.03s to process). Everything else in the pipeline is fast on any hardware.
+
+**The filler phrase** ("One sec...") starts playing the moment Whisper returns, before the LLM has even started — so you perceive ~1s of latency from the moment you stop talking, with the AI's pause feeling like thinking, not lag.
+
+## Hardware tiers
+
+Hermes Voice auto-detects your hardware and picks the best configuration. The `start-all.sh` script does this automatically — no manual setup needed.
+
+### Tier 1 — works on anything (CPU only)
+
+**What you need:** Any computer, no GPU required.
+
+| | |
+|---|---|
+| Whisper model | `large-v3-turbo` |
+| Compute type | `int8` |
+| Beam size | 1 |
+| Time per 1s of audio | ~9s |
+| Interim STT | disabled (CPU can't keep up with parallel calls) |
+| Feel | "Alexa in 2014" — slow but works |
+
+**Use this if:** you're on a laptop without a discrete GPU, or you're on a Raspberry Pi, or you're just trying things out.
+
+### Tier 2 — modern desktop / Apple Silicon (recommended)
+
+**What you need:** Discrete NVIDIA GPU with 8GB+ VRAM (RTX 3060, 4060, or better) OR an Apple Silicon Mac (M1/M2/M3/M4) with 8GB+ unified memory.
+
+| | |
+|---|---|
+| Whisper model | `large-v3-turbo` |
+| Compute type | `float16` |
+| Beam size | 1 |
+| Time per 1s of audio | ~0.4s |
+| Interim STT | enabled (sub-second partial transcripts as you talk) |
+| Feel | "ChatGPT Voice" — instant and natural |
+
+**Use this if:** you have a gaming PC from the last 3-4 years, a Mac with Apple Silicon, or a workstation with an NVIDIA card. This covers most desktop users in 2026.
+
+### Tier 3 — enthusiast / server (our setup)
+
+**What you need:** 16GB+ NVIDIA GPU (RTX 4080/5080, A4000, etc.) and a beefy CPU. This is the setup you'd run on a home server or workstation.
+
+Same software as Tier 2, just more headroom. Useful if you're running multiple voice sessions, batch-processing audio, or planning to add local LLMs later (Llama 8B on a 16GB GPU is a future possibility).
+
+### Auto-detection
+
+The `start-all.sh` script picks your tier automatically:
+
+```bash
+./start-all.sh
+# GPU detected — using float16 (requires ctranslate2>=4.7.2 for sm_120)
+# Starting Whisper STT server (model=...turbo, compute=float16, beam=1) on :9001...
+# Whisper ready.
+# Starting hermes-voice gateway on :7979...
+```
+
+Manual override if auto-detection is wrong:
+
+```bash
+# Force CPU mode
+WHISPER_COMPUTE_TYPE=int8 ./start-all.sh
+
+# Force GPU mode (will fail loudly if CUDA isn't actually available)
+WHISPER_COMPUTE_TYPE=float16 ./start-all.sh
+```
+
+### Speed reference
+
+Real measurements on our hardware (RTX 5080, 16GB VRAM, ctranslate2 4.7.2):
+
+| Audio length | Cold (first run) | Warm (subsequent) |
+|---|---|---|
+| 1 second | ~0.5s | ~0.05s |
+| 11 seconds (JFK sample) | 1.4s | **0.35s** |
+| 30 seconds | ~3.5s | ~1s |
+
+On CPU (no GPU, int8, beam=1) the same audio takes 9-15s regardless of length.
+
+### Why ctranslate2 version matters
+
+If you have an NVIDIA GPU from 2024 or later (RTX 40-series, RTX 50-series, anything Blackwell / Ada Lovelace / Hopper), you need `ctranslate2>=4.7.2`. Earlier versions fall back to a slow generic path because they don't have the new GPU kernels.
+
+If you see Whisper taking 1.5x realtime on a modern GPU, your `ctranslate2` is too old:
+
+```bash
+pip install --upgrade ctranslate2
+```
+
+The `requirements-whisper.txt` already pins this. If you built Whisper from a system package manager instead of pip, check the version it ships.
 
 ## Barge-in (interrupting the AI)
 

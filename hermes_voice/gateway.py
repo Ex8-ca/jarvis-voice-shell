@@ -521,7 +521,7 @@ async def voice_websocket(ws: WebSocket):
                 # to re-enable for GPU deployments.
                 if vad.state == VADState.SPEAKING:
                     speech_buffer.append(data)
-                    if INTERIM_STT_ENABLED:
+                    if INTERIM_STT_ENABLED == "1":
                         now = time.monotonic()
                         if now - last_interim_send > INTERIM_INTERVAL:
                             last_interim_send = now
