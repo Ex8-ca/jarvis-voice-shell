@@ -32,12 +32,12 @@ Browser mic ──► Web UI (:8989) ──► Whisper (:9001) ──► LLM API
 
 ### Split-architecture mode
 
-Mic + speakers on your desktop; STT + LLM + TTS on a server. Useful when the desktop is underpowered or you want a "voice satellite" setup. The Python client (`jarvis_voice_client.py`) does the audio I/O locally; everything heavy runs remotely.
+Mic + speakers on your desktop; STT + LLM + TTS on a server. Useful when the desktop is underpowered or you want a "voice satellite" setup. The Python client (`hermes_voice.client`) does the audio I/O locally; everything heavy runs remotely.
 
 ```
 Desktop (.2)                                              Server (.3)
 ───────────                                               ─────────
-Microphone ──► Python client ──── WebSocket ────► JARVIS gateway (:8989)
+Microphone ──► Python client ──── WebSocket ────► Hermes gateway (:7979)
                                                         │
                                                         ├─► Whisper (:9001)
                                                         ├─► Groq / DeepSeek / OpenAI
@@ -56,8 +56,18 @@ hermes-voice/
 │   └── jarvis_web.py            FastAPI web UI + WebSocket gateway. Both modes share this.
 │                                  1330 lines. Browser-facing HTML/JS embedded.
 │
-├── jarvis_voice_client.py       Standalone Python client for split-architecture mode.
-│                                  733 lines. Pure sounddevice, no browser.
+├── hermes_voice/
+│   ├── client.py                Python voice client for split-architecture mode.
+│   │                              750+ lines. Pure sounddevice, no browser. Sends
+│   │                              raw PCM over WebSocket to the gateway.
+│   ├── gateway.py               FastAPI WebSocket gateway + REST /health endpoint.
+│   ├── vad.py                   Energy-based VAD
+│   ├── llm.py / tts.py / memory.py / persona.py / naming.py
+│   └── skills_registry.py / tools/    Plugin-internal skill registration
+│
+├── web/jarvis_web.py            Legacy single-machine FastAPI web UI (browser-based).
+│                                  Optional — use the plugin's gateway unless you
+│                                  want a browser UI on a remote box.
 │
 ├── whisper-server/
 │   └── server.py                Faster-Whisper HTTP server. OpenAI-compatible /v1/audio/transcriptions.
@@ -80,7 +90,7 @@ hermes-voice/
 ├── tests/                       pytest suite (~200 tests). Covers VAD, barge-in, TTS, devices, etc.
 │
 ├── systemd/
-│   └── jarvis-voice-client.service   Example systemd unit for the Python client
+│   └── jarvis-voice-client.service   Drop-in systemd --user unit for the Python client
 │
 ├── docs/plans/                  Design docs and planning notes
 │
@@ -90,14 +100,13 @@ hermes-voice/
 ├── requirements.txt             Shared deps
 ├── requirements-web.txt         Web UI / gateway deps
 ├── requirements-whisper.txt     Whisper server deps
-├── requirements-client.txt      Python client deps
+├── requirements-client.txt      Python client deps (sounddevice, numpy, websockets, miniaudio, python-dotenv)
 │
 ├── .env.example                 Configuration template — copy to .env
-├── start-all.sh                 Launches Whisper + Web UI together
-├── run.sh                       Just the Web UI
-├── start-jarvis-linux.sh        Linux launcher for the Python client
-│
-└── Start-JARVIS*.bat            Windows launchers (Hermes, PTT, OpenAI variants)
+├── start-all.sh                 Launches Whisper + gateway together (server side)
+├── run.sh                       Just the gateway (server side)
+├── bootstrap.sh                 Server-side install: venv + Whisper deps + ctranslate2
+├── bootstrap-client.sh          Client-side install: venv + 5 small packages, no Whisper
 ```
 
 ## Prerequisites
@@ -112,7 +121,12 @@ hermes-voice/
 | **Edge TTS** | Text-to-speech | Free, runs in the cloud (Microsoft), no key needed |
 | **GPU (optional)** | Faster Whisper (~30x realtime vs ~1x) | Any NVIDIA 8GB+ works. Apple Silicon works too. CPU is fine, just slower. |
 
-> **Don't run `pip install` manually.** Run `./bootstrap.sh` instead — it picks the right deps, sets up the venv, and starts Whisper. See the [Quickstart](#quickstart) below.
+> **Don't run `pip install` manually.**
+> - **Server side** (Whisper + gateway + LLM + TTS): run `./bootstrap.sh`
+> - **Client side** (desktop mic + speakers, split-architecture): run `./bootstrap-client.sh`
+>
+> Each script picks the right deps, sets up the venv, and offers to start the
+> relevant services. See the [Quickstart](#quickstart) below.
 
 ### System packages (Linux only)
 
@@ -252,34 +266,117 @@ open http://localhost:8989
 
 ## Quickstart — split architecture
 
+You run the **mic + speakers** on one machine (often a laptop or a Raspberry Pi
+sitting on your desk), and the **Whisper + LLM + TTS** on another (a beefier
+box with a GPU). The two talk over WebSocket.
+
 ### On the server (Whisper + LLM + TTS)
 
 ```bash
 git clone https://github.com/Ex8-ca/hermes-voice.git
 cd hermes-voice
 ./bootstrap.sh              # venv + Whisper + deps
-# Edit .env and set GROQ_API_KEY=gsk_...
-
+# Edit .env and set GROQ_API_KEY=***
 ./start-all.sh              # starts Whisper + gateway on :7979 (or HERMES_VOICE_PORT)
 ```
 
-The Web UI on `HERMES_VOICE_PORT` (default 7979) is also the gateway — clients connect to it via WebSocket.
+The Web UI on `HERMES_VOICE_PORT` (default 7979) is also the gateway — clients
+connect to it via WebSocket. Verify it's up:
+
+```bash
+curl http://localhost:7979/health
+# → {"status":"ok","uptime_s":...,"whisper":"ok","tier":"gpu",...}
+```
 
 ### On the desktop (mic + speakers)
+
+The desktop only needs Python + 4 small packages (sounddevice, numpy,
+websockets, miniaudio, python-dotenv). No Whisper, no GPU.
+
+**1. Install system packages** (required for `sounddevice` to compile):
+
+```bash
+# Debian / Ubuntu / Pop!_OS
+sudo apt install -y libportaudio2 portaudio19-dev libasound2-dev
+
+# Fedora
+sudo dnf install -y portaudio portaudio-devel alsa-lib-devel
+
+# Arch
+sudo pacman -S portaudio alsa-lib
+```
+
+**2. Clone and bootstrap the client side:**
 
 ```bash
 git clone https://github.com/Ex8-ca/hermes-voice.git
 cd hermes-voice
-./bootstrap.sh --with-client   # adds sounddevice + websockets to the same venv
+./bootstrap-client.sh 192.168.1.50 7979
+# (host and port are the server's IP and HERMES_VOICE_PORT)
+# Prompts for GROQ_API_KEY — same key the server uses.
+```
 
-# Point at the server
-export HERMES_WS_HOST=192.168.1.50
-export HERMES_WS_PORT=7979
+`bootstrap-client.sh` creates a venv, installs the 5 client packages, writes
+`.env` with `chmod 600`, and verifies the import. Idempotent — safe to re-run.
 
+**3. Run the client:**
+
+```bash
+# From the repo dir
+./venv/bin/python -m hermes_voice.client
+# Or, if you've activated the venv:
+source venv/bin/activate
 python -m hermes_voice.client
 ```
 
-For Linux: `systemd/jarvis-voice-client.service` is a drop-in unit. Set `HERMES_WS_HOST` in the unit's `Environment=` and enable it.
+You should see:
+
+```
+[INFO] hermes-voice-client: hermes-voice client → ws://192.168.1.50:7979/ws
+[INFO] hermes-voice-client: WebSocket connected
+[INFO] hermes-voice-client: mic: frame SENT (RMS=0, muted=False)
+```
+
+Speak into the mic. `RMS=` should jump from 0 to 200-2000+ while you talk,
+and you'll hear the AI's response through your default speaker.
+
+**4. Pick the right mic.** If the wrong device is being used (e.g. your
+webcam mic instead of your headset), find devices and force the index:
+
+```bash
+./venv/bin/python -c "import sounddevice; print(sounddevice.query_devices())"
+# Look at the 'name' and 'index' columns.
+
+# Force a specific input device:
+HERMES_VOICE_INPUT_DEVICE=5 ./venv/bin/python -m hermes_voice.client
+# (Or add `HERMES_VOICE_INPUT_DEVICE=5` to your .env to make it permanent.)
+```
+
+### Environment variables (client side)
+
+| Var | Default | What it does |
+|---|---|---|
+| `HERMES_VOICE_WS_HOST` | `127.0.0.1` | Gateway hostname or IP |
+| `HERMES_VOICE_WS_PORT` | `8989` | Gateway WebSocket port (use `7979` for the plugin's default) |
+| `HERMES_VOICE_INPUT_DEVICE` | system default | sounddevice input device index |
+| `HERMES_VOICE_OUTPUT_DEVICE` | system default | sounddevice output device index |
+| `GROQ_API_KEY` | — | Same key the gateway uses; needed for some LLM paths |
+
+All of these can go in `~/.hermes-voice/.env` and the client will read them
+automatically. Real env vars still take precedence.
+
+### Auto-start on boot (Linux)
+
+A drop-in systemd --user unit lives at `systemd/jarvis-voice-client.service`.
+Adjust the `WorkingDirectory`, `ExecStart`, and any `Environment=` lines, then:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/jarvis-voice-client.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now jarvis-voice-client
+loginctl enable-linger marc   # keep it running after logout
+```
 
 ## LLM provider priority
 
@@ -461,6 +558,102 @@ JARVIS_TTS_VOICE=en-GB-RyanNeural
 ```
 
 The gateway also reads `~/.hermes/SOUL.md` and `~/.hermes/USER.md` automatically if they exist (Hermes users).
+
+## Troubleshooting
+
+### Client: `ModuleNotFoundError: No module named 'sounddevice'`
+
+The venv has numpy, websockets, and python-dotenv, but `sounddevice` and
+`miniaudio` failed to install. **Most common cause:** missing PortAudio headers.
+
+```bash
+sudo apt install -y libportaudio2 portaudio19-dev libasound2-dev   # Debian/Ubuntu
+sudo dnf install -y portaudio portaudio-devel alsa-lib-devel       # Fedora
+sudo pacman -S portaudio alsa-lib                                 # Arch
+```
+
+Then re-run `./bootstrap-client.sh` — it's idempotent. The two packages will
+compile against the headers and install cleanly.
+
+### Client: `hermes-voice client → ws://127.0.0.1:8989/ws` (ignoring your .env)
+
+The client connected to localhost instead of your gateway's IP. Two causes:
+
+1. **You're using the system Python** (`python3 -m hermes_voice.client`)
+   without activating the venv. `python-dotenv` is only in the venv, so the
+   `.env` file is silently ignored. Use `./venv/bin/python -m hermes_voice.client`
+   instead — no `source venv/bin/activate` needed.
+
+2. **The `.env` file is missing or has placeholder values.** Check that
+   `HERMES_VOICE_WS_HOST=<your gateway IP>` and `HERMES_VOICE_WS_PORT=7979`
+   are set, and the IP is reachable (`nc -vz <host> 7979` should say `succeeded`).
+
+### Client: `mic: frame SENT (RMS=0, muted=False)` even while I'm talking
+
+The mic is opening and frames are flowing, but they're silent. The wrong
+audio device is selected. PulseAudio/PipeWire's "default" often resolves to
+a webcam mic or a Bluetooth headset that's currently disconnected.
+
+```bash
+./venv/bin/python -c "import sounddevice; print(sounddevice.query_devices())"
+```
+
+Find the right mic's index, then:
+
+```bash
+HERMES_VOICE_INPUT_DEVICE=5 ./venv/bin/python -m hermes_voice.client
+```
+
+Add `HERMES_VOICE_INPUT_DEVICE=5` to `.env` to make it permanent.
+
+**Bluetooth headset gotcha:** if you disconnect/reconnect the headset, the
+default device index can shift. Disconnect and reconnect the headset, or
+re-run the device-list command to find the new index.
+
+### Server: `port 7979 already in use`
+
+Another process is on 7979. The most common collision is `audioforge`
+(port 8989) on the reference host. Two options:
+
+- **Set a different port** in `.env`: `HERMES_VOICE_PORT=7978` (or any free port).
+  Update the client to match: `HERMES_VOICE_WS_PORT=7978` in its `.env`.
+- **Move the colliding process** to a different port if you're not actively
+  using it (e.g. `sudo systemctl disable --now audioforge.service` to free 8989).
+
+### Server: `/health` says `whisper: down`
+
+The gateway is up but can't reach the Whisper server. Usually means
+`start-all.sh` wasn't used (Whisper isn't running) or Whisper crashed.
+
+```bash
+# Check if Whisper is on 9001
+curl -s http://127.0.0.1:9001/v1/models
+
+# Or just restart everything cleanly
+./start-all.sh
+```
+
+### Server: STT takes 1.5x realtime on a modern GPU
+
+Your `ctranslate2` is too old. For RTX 40-series, 50-series, or anything
+Blackwell/Ada/Hopper, you need `ctranslate2>=4.7.2`:
+
+```bash
+./venv/bin/python -m pip install --upgrade 'ctranslate2>=4.7.2'
+# Then restart start-all.sh
+```
+
+### Client connects, server logs "WebSocket voice connected", but no audio round-trips
+
+The WebSocket is open, but the client isn't actually capturing mic audio.
+Check the client log for `mic: frame SENT (RMS=N, muted=False)` — if `RMS=0`
+and never moves, the mic stream opened successfully but on a silent device.
+See the "wrong device" troubleshooting above.
+
+If `RMS` moves but the server still gets no audio, check the client log for
+barge-in events firing repeatedly — the mic may be getting muted because the
+AI's TTS audio is bleeding into it. Lower your speaker volume, or use
+headphones.
 
 ## Development
 

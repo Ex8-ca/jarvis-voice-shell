@@ -5,14 +5,20 @@ Documentation=https://github.com/Ex8-ca/hermes-voice
 
 [Service]
 Type=simple
-# Adjust these paths to match your install
+# Adjust these paths and the gateway address to match your install.
+# HERMES_VOICE_WS_HOST = the IP/hostname of the box running the gateway
+# HERMES_VOICE_WS_PORT = the gateway's HERMES_VOICE_PORT (default 7979)
 Environment=HOME=/home/%u
+Environment=HERMES_VOICE_WS_HOST=192.168.1.50
+Environment=HERMES_VOICE_WS_PORT=7979
 WorkingDirectory=/home/%u/hermes-voice
-ExecStart=/home/%u/hermes-voice/venv/bin/python /home/%u/hermes-voice/jarvis_voice_client.py
+# .env in the working directory is auto-loaded by the client — no need to
+# repeat keys here unless you want to override.
+ExecStart=/home/%u/hermes-voice/venv/bin/python -m hermes_voice.client
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
+# Bluetooth headsets drop out — restart=always would just hammer the
+# connection. on-failure + 5s delay is enough for transient blips.
 
 [Install]
 WantedBy=default.target
