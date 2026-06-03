@@ -87,18 +87,83 @@ def _is_server_responding(port: int) -> bool:
         return False
 
 
+def _is_our_server(port: int) -> bool:
+    """Check if a server on `port` is *us* (hermes-voice), not audioforge
+    or anything else that happens to be listening.
+
+    Uses /health which returns a JSON with a `whisper_url` field — unique
+    to our gateway. A port that returns 200 on / but 404 or non-JSON on
+    /health is not us.
+    """
+    import json as _json
+    import urllib.request
+    import urllib.error
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+        # Our gateway has these fields. Other servers (audioforge, etc.)
+        # won't have all three.
+        return all(k in payload for k in ("status", "whisper", "version"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
 def start_server(*, port: Optional[int] = None, quiet: bool = True) -> bool:
     """Start the hermes_voice FastAPI server as a subprocess.
 
     Returns True if the server is running (or was already running).
+
+    Port resolution (in order):
+      1. Explicit `port=` arg
+      2. $HERMES_VOICE_PORT from the live process env (in case .env was
+         edited after plugin import — the import-time DEFAULT_PORT can be
+         stale)
+      3. DEFAULT_PORT (set at plugin import from .env)
+      4. "7979" (last-resort default; audioforge owns 8989 on the
+         reference host)
     """
     global _server_process
 
-    port = port or DEFAULT_PORT
+    if port is None:
+        # Re-read .env in case it was edited after the plugin was loaded
+        # (the import-time DEFAULT_PORT may be stale). This way users can
+        # edit .env, then run /hermes-voice restart, without restarting
+        # the entire Hermes gateway.
+        try:
+            from dotenv import load_dotenv
+            env_path = Path(__file__).resolve().parent / ".env"
+            if env_path.exists():
+                load_dotenv(env_path, override=False)
+        except ImportError:
+            pass
+        port = int(os.environ.get("HERMES_VOICE_PORT", str(DEFAULT_PORT)))
 
-    if _port_in_use(port) and _is_server_responding(port):
+    # If our server is already running on `port`, we're done. We check for
+    # *our* server (not just "is anything listening on this port") because
+    # audioforge and other services might be using ports we want.
+    if _port_in_use(port) and _is_our_server(port):
         logger.info("hermes-voice server already running on port %d", port)
         return True
+
+    # If something else owns the port (e.g. audioforge on 8989), fail loudly
+    # with a clear error instead of silently starting on a different port
+    # or claiming success.
+    if _port_in_use(port):
+        # Try to identify what's on the port for the error message
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=1) as resp:
+                server_hint = f"responding to GET / with status {resp.status}"
+        except Exception as e:
+            server_hint = f"port in use (connect error: {e})"
+        err = (
+            f"Cannot start hermes-voice on port {port} — "
+            f"a different server is already {server_hint}. "
+            f"Set HERMES_VOICE_PORT to a free port (e.g. 7979) in .env, "
+            f"or pass it: /hermes-voice start 7979"
+        )
+        logger.error(err)
+        return False
 
     plugin_dir = _get_plugin_dir()
 
@@ -163,7 +228,7 @@ def start_server(*, port: Optional[int] = None, quiet: bool = True) -> bool:
         # Wait a moment for startup
         import time
         time.sleep(2)
-        return _is_server_responding(port)
+        return _is_our_server(port)
 
     except Exception as e:
         logger.error("Failed to start hermes-voice server: %s", e)
@@ -190,9 +255,13 @@ def _stop_server() -> None:
 
 
 def stop_server() -> bool:
-    """Public stop — callable from slash command."""
+    """Public stop — callable from slash command.
+
+    Stops our gateway subprocess and verifies it's actually gone (not
+    just that the port is free — another service might be using it).
+    """
     _stop_server()
-    return not _port_in_use(DEFAULT_PORT)
+    return not _is_our_server(DEFAULT_PORT)
 
 
 def restart_server(*, port: Optional[int] = None) -> bool:
@@ -217,10 +286,26 @@ def get_server_status() -> dict:
     port = DEFAULT_PORT
     base = f"http://127.0.0.1:{port}"
 
-    if _port_in_use(port) and _is_server_responding(port):
-        try:
-            with urllib.request.urlopen(f"{base}/health", timeout=2) as resp:
-                payload = _json.loads(resp.read().decode("utf-8"))
+    # Re-read .env so an edit after plugin import is reflected
+    try:
+        from dotenv import load_dotenv
+        env_path = Path(__file__).resolve().parent / ".env"
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+    except ImportError:
+        pass
+    port = int(os.environ.get("HERMES_VOICE_PORT", str(port)))
+    base = f"http://127.0.0.1:{port}"
+
+    # Probe /health (only our gateway returns this JSON shape). If a
+    # different server is on this port (e.g. audioforge on 8989), this
+    # will fail and we report "not running" — not "running on someone
+    # else's port" (which is what the old code did).
+    try:
+        with urllib.request.urlopen(f"{base}/health", timeout=2) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+        # Sanity check: must have our fields
+        if all(k in payload for k in ("status", "whisper", "version")):
             return {
                 "running": True,
                 "port": port,
@@ -231,8 +316,8 @@ def get_server_status() -> dict:
                 "tier": payload.get("tier", ""),
                 "version": payload.get("version", ""),
             }
-        except (urllib.error.URLError, OSError, ValueError):
-            pass  # fall through to minimal report
+    except (urllib.error.URLError, OSError, ValueError):
+        pass  # fall through to "not running" report
 
     return {
         "running": False,
@@ -286,13 +371,34 @@ Subcommands:
 
 def _handle_voice_command(raw_args: str) -> Optional[str]:
     """Handle /hermes-voice slash command."""
+    import io
     argv = raw_args.strip().split()
     sub = argv[0] if argv else "status"
 
     if sub == "start":
-        port = int(argv[1]) if len(argv) > 1 else DEFAULT_PORT
-        if start_server(port=port):
-            return f"Hermes Voice server started at http://127.0.0.1:{port}"
+        # Pass None (not DEFAULT_PORT) when no explicit port given, so
+        # start_server() can re-read $HERMES_VOICE_PORT from the live env.
+        # This way editing .env then /hermes-voice restart works without
+        # restarting the whole Hermes gateway.
+        port = int(argv[1]) if len(argv) > 1 else None
+        actual_port = port or int(os.environ.get("HERMES_VOICE_PORT", str(DEFAULT_PORT)))
+        # Capture the logger output so we can surface the real error
+        # (e.g. "port already in use by another server") to the chat user.
+        log_buf = io.StringIO()
+        log_handler = logging.StreamHandler(log_buf)
+        log_handler.setLevel(logging.ERROR)
+        log_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+        plugin_logger = logging.getLogger("hermes-voice.plugin")
+        plugin_logger.addHandler(log_handler)
+        try:
+            ok = start_server(port=port)
+        finally:
+            plugin_logger.removeHandler(log_handler)
+        if ok:
+            return f"Hermes Voice server started at http://127.0.0.1:{actual_port}"
+        captured = log_buf.getvalue().strip()
+        if captured:
+            return f"Failed to start Hermes Voice server:\n{captured}"
         return "Failed to start Hermes Voice server — check logs"
 
     if sub == "stop":
@@ -301,9 +407,10 @@ def _handle_voice_command(raw_args: str) -> Optional[str]:
         return "Failed to stop Hermes Voice server"
 
     if sub == "restart":
-        port = int(argv[1]) if len(argv) > 1 else DEFAULT_PORT
+        port = int(argv[1]) if len(argv) > 1 else None
+        actual_port = port or int(os.environ.get("HERMES_VOICE_PORT", str(DEFAULT_PORT)))
         if restart_server(port=port):
-            return f"Hermes Voice server restarted at http://127.0.0.1:{port}"
+            return f"Hermes Voice server restarted at http://127.0.0.1:{actual_port}"
         return "Failed to restart Hermes Voice server"
 
     if sub == "status":
@@ -364,7 +471,7 @@ def register(ctx) -> None:
         logger.warning("hermes-voice server auto-start failed: %s", e)
         started = False
 
-    if not started and not _is_server_responding(DEFAULT_PORT):
+    if not started and not _is_our_server(DEFAULT_PORT):
         # Distinguish "no Python deps" (import failed) from "deps OK but
         # no Whisper" (different fix). The latter is recoverable with
         # ./bootstrap.sh; the former needs pip install.
