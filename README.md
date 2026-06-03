@@ -35,8 +35,8 @@ Browser mic ──► Web UI (:8989) ──► Whisper (:9001) ──► LLM API
 Mic + speakers on your desktop; STT + LLM + TTS on a server. Useful when the desktop is underpowered or you want a "voice satellite" setup. The Python client (`hermes_voice.client`) does the audio I/O locally; everything heavy runs remotely.
 
 ```
-Desktop (.2)                                              Server (.3)
-───────────                                               ─────────
+Desktop / voice satellite                      Server / GPU box
+─────────────────────                          ────────────────
 Microphone ──► Python client ──── WebSocket ────► Hermes gateway (:7979)
                                                         │
                                                         ├─► Whisper (:9001)
@@ -46,7 +46,7 @@ Microphone ──► Python client ──── WebSocket ────► Hermes
 Speakers
 ```
 
-This is what I use: `.2` is my laptop (mic + speakers), `.3` is a server in the basement (Whisper + LLM + TTS). Audio stays local, compute is remote, latency is fine on a LAN.
+Common split setup: a small/quiet box on your desk (laptop, mini-PC, Raspberry Pi) handles mic + speakers, and a more powerful machine on the LAN (or over Tailscale) runs Whisper + LLM + TTS. Audio stays local; compute is remote; latency is fine on a LAN.
 
 ## Repository layout
 
@@ -199,7 +199,9 @@ Then open **http://localhost:8989** in your browser. Grant mic permission, talk.
 | `./bootstrap.sh` | Creates Python venv, installs `faster-whisper` + `edge-tts` + `ctranslate2`, sets up `whisper-server`, writes `WHISPER_URL` to `.env`, downloads the default model | you already have a working venv + Whisper on a port |
 | `/hermes-voice start` | Spawns the gateway in the background on port 7979 (or `HERMES_VOICE_PORT` if you set one) | you set up a systemd service to start it on boot |
 
-> **Default port is 7979, not 8989.** Port 8989 is owned by `audioforge` on the reference host. If 8989 is free on your machine, set `HERMES_VOICE_PORT=8989` in `.env` before starting.
+> **Default port is 7979.** If another service is already using it, set
+> `HERMES_VOICE_PORT=<some-free-port>` in `.env` before starting. Run
+> `ss -tln | grep 7979` (or `lsof -i :7979`) to see what's there.
 
 ### Verify it worked
 
@@ -444,7 +446,7 @@ Hermes Voice auto-detects your hardware and picks the best configuration. The `s
 
 **Use this if:** you have a gaming PC from the last 3-4 years, a Mac with Apple Silicon, or a workstation with an NVIDIA card. This covers most desktop users in 2026.
 
-### Tier 3 — enthusiast / server (our setup)
+### Tier 3 — enthusiast / server
 
 **What you need:** 16GB+ NVIDIA GPU (RTX 4080/5080, A4000, etc.) and a beefy CPU. This is the setup you'd run on a home server or workstation.
 
@@ -474,7 +476,7 @@ WHISPER_COMPUTE_TYPE=float16 ./start-all.sh
 
 ### Speed reference
 
-Real measurements on our hardware (RTX 5080, 16GB VRAM, ctranslate2 4.7.2):
+Reference measurements on an RTX 5080 (16GB VRAM, ctranslate2 4.7.2):
 
 | Audio length | Cold (first run) | Warm (subsequent) |
 |---|---|---|
@@ -612,13 +614,27 @@ re-run the device-list command to find the new index.
 
 ### Server: `port 7979 already in use`
 
-Another process is on 7979. The most common collision is `audioforge`
-(port 8989) on the reference host. Two options:
+Another process is already bound to 7979. Pick a different port and update
+both the server and the client to use it.
 
-- **Set a different port** in `.env`: `HERMES_VOICE_PORT=7978` (or any free port).
-  Update the client to match: `HERMES_VOICE_WS_PORT=7978` in its `.env`.
-- **Move the colliding process** to a different port if you're not actively
-  using it (e.g. `sudo systemctl disable --now audioforge.service` to free 8989).
+```bash
+# See what's on 7979
+ss -tlnp | grep 7979
+lsof -i :7979
+
+# Pick a free port (7978, 8000, 8080 — anything not in use)
+echo "HERMES_VOICE_PORT=7978" >> .env
+
+# On the desktop client side, point to the same port
+echo "HERMES_VOICE_WS_PORT=7978" >> .env
+
+# Restart the gateway
+/hermes-voice restart
+```
+
+If you're not actively using the conflicting service, you can free 7979 by
+stopping it — but the safer default is to leave it alone and pick a different
+port for hermes-voice.
 
 ### Server: `/health` says `whisper: down`
 
