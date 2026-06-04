@@ -917,6 +917,8 @@ async def _process_chat(text: str):
 
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": text}]
     goto_tts = False
+    response_text = ""  # initialized; set by either primary or deep path
+    bridge_ms = 0.0
 
     # Pre-LLM hook: detect memory/tool/web queries and route directly to deep path.
     # This is more reliable than relying on the primary LLM to output [[DEEP_QUERY]].
@@ -964,70 +966,68 @@ async def _process_chat(text: str):
         else:
             logger.warning("Chat endpoint: deep query triggered but no deep LLM configured")
 
-    if not locals().get('goto_tts'):
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": text}]
+    if not goto_tts:
+        # Collect the full streamed response
+        response_text = ""
+        async for token in stream_chat(messages, max_tokens=max_tok):
+            response_text += token
+        bridge_ms = (time.perf_counter() - bridge_start) * 1000
 
-    # Collect the full streamed response
-    response_text = ""
-    async for token in stream_chat(messages, max_tokens=max_tok):
-        response_text += token
-    bridge_ms = (time.perf_counter() - bridge_start) * 1000
-
-    # Check if the primary LLM needs the full agent loop for tools/memory/skills.
-    # The voice LLM is instructed to output [[DEEP_QUERY]] when it needs more.
-    deep_llm = None
-    if "[[DEEP_QUERY]]" in response_text:
-        logger.info("Chat endpoint: primary LLM requested deep query")
-        from llm import pick_deep_llm
-        deep_llm = pick_deep_llm()
-        if deep_llm and deep_llm[0]:
-            logger.info(f"Chat endpoint: routing to deep provider: {deep_llm[3]}")
-            # Re-call the LLM with the same messages, but on the deep provider
-            deep_start = time.perf_counter()
-            deep_response = ""
-            # Use httpx directly to hit the deep endpoint (avoids changing the global
-            # picked provider and keeps voice_primary state clean).
-            import httpx
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.post(
-                        deep_llm[0],
-                        json={
-                            "model": deep_llm[2] or "MiniMax-M3",
-                            "messages": messages,
-                            "max_tokens": max_tok * 3,
-                        },
-                        headers={"Authorization": f"Bearer {deep_llm[1]}"},
-                    )
-                    resp.raise_for_status()
-                    body = resp.json()
-                    deep_response = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-            except Exception as e:
-                logger.error(f"Chat endpoint: deep query failed: {e}")
+        # Check if the primary LLM needs the full agent loop for tools/memory/skills.
+        # The voice LLM is instructed to output [[DEEP_QUERY]] when it needs more.
+        deep_llm = None
+        if "[[DEEP_QUERY]]" in response_text:
+            logger.info("Chat endpoint: primary LLM requested deep query")
+            from llm import pick_deep_llm
+            deep_llm = pick_deep_llm()
+            if deep_llm and deep_llm[0]:
+                logger.info(f"Chat endpoint: routing to deep provider: {deep_llm[3]}")
+                # Re-call the LLM with the same messages, but on the deep provider
+                deep_start = time.perf_counter()
                 deep_response = ""
-            bridge_ms += (time.perf_counter() - deep_start) * 1000
-            if deep_response.strip():
-                response_text = deep_response.strip()
-                logger.info(f"Chat endpoint: deep response ({len(response_text)} chars)")
+                # Use httpx directly to hit the deep endpoint (avoids changing the global
+                # picked provider and keeps voice_primary state clean).
+                import httpx
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(
+                            deep_llm[0],
+                            json={
+                                "model": deep_llm[2] or "MiniMax-M3",
+                                "messages": messages,
+                                "max_tokens": max_tok * 3,
+                            },
+                            headers={"Authorization": f"Bearer {deep_llm[1]}"},
+                        )
+                        resp.raise_for_status()
+                        body = resp.json()
+                        deep_response = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+                except Exception as e:
+                    logger.error(f"Chat endpoint: deep query failed: {e}")
+                    deep_response = ""
+                bridge_ms += (time.perf_counter() - deep_start) * 1000
+                if deep_response.strip():
+                    response_text = deep_response.strip()
+                    logger.info(f"Chat endpoint: deep response ({len(response_text)} chars)")
+                else:
+                    response_text = "I wasn't able to look that up right now."
             else:
-                response_text = "I wasn't able to look that up right now."
-        else:
-            logger.warning("Chat endpoint: [[DEEP_QUERY]] requested but no deep LLM configured")
-            response_text = response_text.replace("[[DEEP_QUERY]]", "").strip()
-            if not response_text:
-                response_text = "I need to check something but the deep connection isn't set up."
+                logger.warning("Chat endpoint: [[DEEP_QUERY]] requested but no deep LLM configured")
+                response_text = response_text.replace("[[DEEP_QUERY]]", "").strip()
+                if not response_text:
+                    response_text = "I need to check something but the deep connection isn't set up."
 
-    # Step 1.5: Tool dispatch (chat endpoint) — silently runs tools and feeds
-    # the result back to the LLM. The final response_text has the cleaned answer.
-    async def _chat_on_tool_result(name: str, tool_text: str) -> None:
-        try:
-            append_tool(name, tool_text)
-        except Exception:
-            logger.exception("voice memory: failed to append tool result (chat)")
+        # Step 1.5: Tool dispatch (chat endpoint) — silently runs tools and feeds
+        # the result back to the LLM. The final response_text has the cleaned answer.
+        async def _chat_on_tool_result(name: str, tool_text: str) -> None:
+            try:
+                append_tool(name, tool_text)
+            except Exception:
+                logger.exception("voice memory: failed to append tool result (chat)")
 
-    response_text = await _run_tool_loop(
-        response_text, messages, max_tok, on_tool_result=_chat_on_tool_result
-    )
+        response_text = await _run_tool_loop(
+            response_text, messages, max_tok, on_tool_result=_chat_on_tool_result
+        )
 
     # Persist this turn to voice memory (chat endpoint also shares the log,
     # so a conversation that starts in chat continues seamlessly if the user
