@@ -938,12 +938,18 @@ async def _process_chat(text: str):
             import httpx
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
+                    # Don't pass the voice system prompt to the deep endpoint — it
+                    # contains the [[DEEP_QUERY]] instruction which the deep agent
+                    # would echo back. Just pass the user message directly.
                     resp = await client.post(
                         deep_llm[0],
                         json={
                             "model": deep_llm[2] or "MiniMax-M3",
-                            "messages": [{"role": "system", "content": system_prompt},
-                                         {"role": "user", "content": text}],
+                            "messages": [
+                                {"role": "system", "content": "Answer the user's question directly. "
+                                 "You have full access to tools, memory, and web search. Use them if needed."},
+                                {"role": "user", "content": text}
+                            ],
                             "max_tokens": max_tok * 3,
                         },
                         headers={"Authorization": f"Bearer {deep_llm[1]}"},
@@ -952,7 +958,9 @@ async def _process_chat(text: str):
                     body = resp.json()
                     deep_response = body.get("choices", [{}])[0].get("message", {}).get("content", "")
             except Exception as e:
-                logger.error(f"Chat endpoint: deep query failed: {e}")
+                import traceback
+                logger.error(f"Chat endpoint: deep query failed: {type(e).__name__}: {e}")
+                logger.error(f"  traceback: {traceback.format_exc()}")
                 deep_response = ""
             bridge_ms = (time.perf_counter() - deep_start) * 1000
             if deep_response.strip():
