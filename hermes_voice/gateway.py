@@ -42,7 +42,7 @@ try:
         Path.home() / ".hermes" / "hermes-voice.env",     # user-level .env
     ]:
         if _env_candidate.exists():
-            load_dotenv(_env_candidate, override=False)
+            load_dotenv(_env_candidate, override=True)
             logger.info(f"Loaded env from {_env_candidate}")
             break
 except ImportError:
