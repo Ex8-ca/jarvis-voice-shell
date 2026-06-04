@@ -823,16 +823,42 @@ async def health():
     port = int(os.environ.get("HERMES_VOICE_PORT", "7979"))
     uptime_s = round(_time.time() - _STARTUP_TIME, 1)
 
-    # Probe Whisper — any 2xx/4xx/5xx response means it's up. Timeout/connect
-    # error means it's down. We use a short timeout to keep /health snappy.
+    # Probe Whisper. Prefer the server's own /health endpoint (it confirms
+    # model+device are loaded), then fall back to /v1/models, then to root.
+    # Any HTTP response means the port is alive; only connect/timeout errors
+    # mean it's down. We do NOT call /v1/audio/transcriptions here — that
+    # would cost a model inference per /health hit.
     whisper_status = "unknown"
     try:
         async with httpx.AsyncClient(timeout=2.0) as client:
-            # Hit the base URL of WHISPER_URL (strip /v1/audio/transcriptions)
             base = whisper_url.split("/v1")[0]
-            resp = await client.get(base)
-            whisper_status = "ok" if resp.status_code < 500 else "down"
-    except Exception:
+            for probe_path in ("/health", "/v1/models", "/"):
+                try:
+                    resp = await client.get(base + probe_path)
+                    # 2xx = endpoint exists and reports healthy.
+                    # 404 on /health or /v1/models means the server doesn't
+                    # expose that probe — try the next one.
+                    if resp.status_code == 200 and probe_path == "/health":
+                        try:
+                            body = resp.json()
+                            if isinstance(body, dict) and body.get("status") == "healthy":
+                                whisper_status = "ok"
+                                break
+                            # health endpoint exists but reports not-healthy
+                            whisper_status = "down"
+                            break
+                        except Exception:
+                            whisper_status = "ok"  # 200 with non-JSON = server is up
+                            break
+                    if resp.status_code < 500:
+                        whisper_status = "ok"
+                        break
+                    whisper_status = "down"
+                    break
+                except httpx.HTTPError:
+                    continue
+    except Exception as e:
+        logger.warning("whisper health probe failed: %s", e)
         whisper_status = "down"
 
     # Best-effort tier detection from a marker file start-all.sh may leave.
